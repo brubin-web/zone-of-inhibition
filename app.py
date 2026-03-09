@@ -241,6 +241,159 @@ def measure_spot(gray_clean, diff, spot, plate):
     }
 
 
+def infer_grid(plate_spots, plate):
+    """Given detected spots on one plate, infer the grid structure.
+    Returns (row_positions, col_positions) — only rows/columns with
+    at least 2 spots in them (to avoid false grid lines)."""
+    if len(plate_spots) < 4:
+        return [], []
+
+    pr = plate["r"]
+    gap_threshold = pr * 0.12
+
+    ys = [s["y"] for s in plate_spots]
+    xs = [s["x"] for s in plate_spots]
+
+    def _cluster(vals):
+        sorted_vals = sorted(vals)
+        groups = [[sorted_vals[0]]]
+        for i in range(1, len(sorted_vals)):
+            if sorted_vals[i] - sorted_vals[i - 1] > gap_threshold:
+                groups.append([])
+            groups[-1].append(sorted_vals[i])
+        # Only keep clusters with >= 2 members (real grid lines have multiple spots)
+        return [np.mean(g) for g in groups if len(g) >= 2]
+
+    return _cluster(ys), _cluster(xs)
+
+
+def find_spot_at_position(diff, median, ex, ey, search_radius, plate, min_signal=3.0):
+    """Search for a spot at an expected grid position.
+    Returns (x, y, radius) or None. Requires meaningful signal."""
+    pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
+    h, w = diff.shape
+
+    if math.sqrt((ex - pcx) ** 2 + (ey - pcy) ** 2) > pr * 0.82:
+        return None
+
+    sr = search_radius
+    x1, x2 = max(0, ex - sr), min(w, ex + sr)
+    y1, y2 = max(0, ey - sr), min(h, ey + sr)
+
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return None
+
+    # Find the peak signal in the search area
+    abs_diff_region = np.abs(diff[y1:y2, x1:x2])
+    max_loc = np.unravel_index(abs_diff_region.argmax(), abs_diff_region.shape)
+    best_y = y1 + max_loc[0]
+    best_x = x1 + max_loc[1]
+
+    # Measure radial profile from the peak to check if it looks like a real spot
+    profile = []
+    for r in range(1, min(sr, 50)):
+        na = max(12, int(2 * math.pi * r))
+        angles = np.linspace(0, 2 * math.pi, na, endpoint=False)
+        pxs = np.clip((best_x + r * np.cos(angles)).astype(int), 0, w - 1)
+        pys = np.clip((best_y + r * np.sin(angles)).astype(int), 0, h - 1)
+        profile.append(abs(diff[pys, pxs].mean()))
+
+    if not profile:
+        return None
+
+    peak = max(profile[:min(25, len(profile))])
+    if peak < min_signal:
+        return None
+
+    # Find radius where signal drops to 30% of peak
+    threshold = peak * 0.3
+    radius = 20
+    for r_idx, val in enumerate(profile):
+        if r_idx > 8 and val < threshold:
+            radius = r_idx + 1
+            break
+
+    radius = max(15, min(radius, 55))
+    return (best_x, best_y, radius)
+
+
+def deduplicate_spots(spots, min_dist=40):
+    """Remove duplicate spots that are too close together, keeping the larger one."""
+    if len(spots) < 2:
+        return spots
+    spots_sorted = sorted(spots, key=lambda s: -s["radius"])
+    kept = []
+    for s in spots_sorted:
+        is_dup = False
+        for k in kept:
+            d = math.sqrt((s["x"] - k["x"]) ** 2 + (s["y"] - k["y"]) ** 2)
+            if d < min_dist:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(s)
+    return kept
+
+
+def grid_refine_spots(plate_spots, diff, median, plate):
+    """Use grid structure to find missing spots and remove non-grid detections."""
+    if len(plate_spots) < 4:
+        return plate_spots
+
+    row_positions, col_positions = infer_grid(plate_spots, plate)
+    if len(row_positions) < 2 or len(col_positions) < 2:
+        return plate_spots
+
+    pr = plate["r"]
+    pcx, pcy = plate["cx"], plate["cy"]
+    match_tolerance = pr * 0.10
+    typical_radius = int(np.median([s["radius"] for s in plate_spots]))
+
+    # Build expected grid positions (only inside plate)
+    expected = []
+    for ry in row_positions:
+        for cx in col_positions:
+            if math.sqrt((cx - pcx) ** 2 + (ry - pcy) ** 2) < pr * 0.80:
+                expected.append((int(cx), int(ry)))
+
+    # Match existing spots to grid positions
+    matched_spots = []
+    used_expected = set()
+    for s in plate_spots:
+        best_dist = float('inf')
+        best_ei = -1
+        for ei, (ex, ey) in enumerate(expected):
+            d = math.sqrt((s["x"] - ex) ** 2 + (s["y"] - ey) ** 2)
+            if d < best_dist:
+                best_dist = d
+                best_ei = ei
+        # Keep spots that match a grid position
+        if best_dist < match_tolerance:
+            matched_spots.append(s)
+            used_expected.add(best_ei)
+
+    # If grid matching removed too many spots, grid inference was wrong — abort
+    if len(matched_spots) < len(plate_spots) * 0.5:
+        return plate_spots
+
+    # Search for missing spots at unmatched grid positions
+    search_r = max(40, int(pr * 0.07))
+    pi = plate_spots[0]["plate_idx"]
+    for ei, (ex, ey) in enumerate(expected):
+        if ei in used_expected:
+            continue
+        result = find_spot_at_position(diff, median, ex, ey, search_r, plate)
+        if result:
+            bx, by, br = result
+            matched_spots.append({
+                "x": bx, "y": by,
+                "radius": max(br, int(typical_radius * 0.6)),
+                "plate_idx": pi, "label": ""
+            })
+
+    return deduplicate_spots(matched_spots)
+
+
 def run_detection(rgb, gray, sensitivity=5.0):
     plates = detect_plates(gray, rgb)
     spots = []
@@ -253,9 +406,20 @@ def run_detection(rgb, gray, sensitivity=5.0):
         for cx, cy, radius, circ, strength in raw_spots:
             spots.append({"x": cx, "y": cy, "radius": radius,
                           "plate_idx": pi, "label": ""})
+
     spots = filter_spots_by_size(spots)
-    spots.sort(key=lambda s: (s["plate_idx"], s["y"] // 50, s["x"]))
-    return plates, spots, diff_cache, median_cache
+
+    # Grid-based refinement: per plate, infer grid and fill in missing spots
+    refined = []
+    for pi, plate in enumerate(plates):
+        plate_spots = [s for s in spots if s["plate_idx"] == pi]
+        if len(plate_spots) >= 3:
+            plate_spots = grid_refine_spots(
+                plate_spots, diff_cache[pi], median_cache[pi], plate)
+        refined.extend(plate_spots)
+
+    refined.sort(key=lambda s: (s["plate_idx"], s["y"] // 50, s["x"]))
+    return plates, refined, diff_cache, median_cache
 
 
 # ─── Drawing ────────────────────────────────────────────────────────────────
