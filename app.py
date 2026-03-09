@@ -80,123 +80,152 @@ def build_spot_score_map(gray, rgb, plate):
     return score, diff, median
 
 
-def find_local_maxima(score, plate, min_distance=60, max_candidates=30):
-    """Find local maxima in the score map within the plate."""
+def snap_to_peak(score, x, y, radius=30):
+    """Snap position to the highest score point within radius."""
+    h, w = score.shape
+    x0, y0 = int(x), int(y)
+    best_val = -1
+    best_x, best_y = x0, y0
+    for dy in range(-radius, radius + 1, 2):
+        for dx in range(-radius, radius + 1, 2):
+            if dx * dx + dy * dy > radius * radius:
+                continue
+            px, py = x0 + dx, y0 + dy
+            if 0 <= px < w and 0 <= py < h and score[py, px] > best_val:
+                best_val = score[py, px]
+                best_x, best_y = px, py
+    return best_x, best_y
+
+
+def fit_2x3_grid(score, plate):
+    """Find the best 2x3 grid on the plate using parametric search.
+    Searches over grid center, rotation, column spacing, and row spacing
+    to find the arrangement that maximizes total score map signal.
+    Returns list of up to 6 (x, y) positions."""
     pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
-    rim_limit = pr * 0.78
+    h, w = score.shape
 
-    # Dilate and compare to find local maxima
-    kernel_size = min_distance
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    dilated = cv2.dilate(score, np.ones((kernel_size, kernel_size)))
-    local_max = (score == dilated) & (score > 0.5)
-
-    ys, xs = np.where(local_max)
-    candidates = []
-    for x, y in zip(xs, ys):
-        dist = math.sqrt((x - pcx) ** 2 + (y - pcy) ** 2)
-        if dist < rim_limit:
-            candidates.append((int(x), int(y), float(score[y, x])))
-
-    # Sort by score descending, take top N
-    candidates.sort(key=lambda c: -c[2])
-    return candidates[:max_candidates]
-
-
-def fit_2x3_grid(candidates, plate):
-    """Given candidate spot positions, find the best 2x3 grid arrangement.
-    Returns list of 6 (or fewer) (x, y) positions.
-
-    Strategy:
-    1. Cluster candidate Y positions into 2 rows
-    2. Within each row, pick the 3 strongest candidates with reasonable spacing
-    3. Validate column alignment between rows
-    """
-    if len(candidates) < 3:
-        return [(c[0], c[1]) for c in candidates]
-
-    pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
-    min_row_gap = pr * 0.15  # Minimum Y gap between the two rows
-
-    # Try to find 2 rows by clustering Y coordinates
-    ys = sorted(set(c[1] for c in candidates))
-
+    best_total = -1
     best_grid = None
-    best_score = -1
+    best_params = None
 
-    # Try different Y-splits to find the two rows
-    for split_y in range(len(ys)):
-        for next_y in range(split_y + 1, len(ys)):
-            if ys[next_y] - ys[split_y] < min_row_gap:
-                continue
+    # Coarse search over grid parameters
+    min_col = int(pr * 0.25)
+    max_col = int(pr * 0.55)
+    step_col = max(1, int(pr * 0.05))
 
-            # Split candidates into row1 (above split) and row2 (below split)
-            mid_y = (ys[split_y] + ys[next_y]) / 2
-            row1 = [c for c in candidates if c[1] < mid_y]
-            row2 = [c for c in candidates if c[1] >= mid_y]
+    min_row = int(pr * 0.15)
+    max_row = int(pr * 0.45)
+    step_row = max(1, int(pr * 0.05))
 
-            if not row1 or not row2:
-                continue
+    center_range = int(pr * 0.25)
+    center_step = max(1, int(pr * 0.08))
 
-            # Further cluster within each group — take candidates near the
-            # dominant Y of each group
-            r1_y = np.median([c[1] for c in row1])
-            r2_y = np.median([c[1] for c in row2])
-            row1 = [c for c in row1 if abs(c[1] - r1_y) < pr * 0.12]
-            row2 = [c for c in row2 if abs(c[1] - r2_y) < pr * 0.12]
+    sample_r = 12  # radius for scoring each grid point
 
-            if len(row1) < 1 or len(row2) < 1:
-                continue
+    for angle_deg in range(0, 180, 10):
+        angle = math.radians(angle_deg)
+        ca, sa = math.cos(angle), math.sin(angle)
 
-            # Pick best 3 from each row (sorted by score)
-            row1.sort(key=lambda c: -c[2])
-            row2.sort(key=lambda c: -c[2])
-            top1 = row1[:3]
-            top2 = row2[:3]
+        for col_space in range(min_col, max_col + 1, step_col):
+            for row_space in range(min_row, max_row + 1, step_row):
+                if row_space < col_space * 0.35:
+                    continue
 
-            # Sort each row by X
-            top1.sort(key=lambda c: c[0])
-            top2.sort(key=lambda c: c[0])
+                for cx_off in range(-center_range, center_range + 1, center_step):
+                    for cy_off in range(-center_range, center_range + 1, center_step):
+                        gcx = pcx + cx_off
+                        gcy = pcy + cy_off
 
-            grid = top1 + top2
-            total_score = sum(c[2] for c in grid)
+                        grid = []
+                        all_inside = True
+                        for row in range(2):
+                            for col in range(3):
+                                gx = gcx + (col - 1) * col_space * ca + (row - 0.5) * row_space * (-sa)
+                                gy = gcy + (col - 1) * col_space * sa + (row - 0.5) * row_space * ca
+                                d = math.sqrt((gx - pcx) ** 2 + (gy - pcy) ** 2)
+                                if d > pr * 0.80 or gx < 0 or gx >= w or gy < 0 or gy >= h:
+                                    all_inside = False
+                                    break
+                                grid.append((gx, gy))
+                            if not all_inside:
+                                break
 
-            # Bonus for having 3 per row
-            if len(top1) == 3:
-                total_score *= 1.2
-            if len(top2) == 3:
-                total_score *= 1.2
+                        if not all_inside or len(grid) != 6:
+                            continue
 
-            # Bonus for column alignment between rows
-            if len(top1) >= 2 and len(top2) >= 2:
-                # Check if X positions roughly match between rows
-                col_diffs = []
-                for c1 in top1:
-                    closest = min(top2, key=lambda c2: abs(c2[0] - c1[0]))
-                    col_diffs.append(abs(closest[0] - c1[0]))
-                avg_col_diff = np.mean(col_diffs)
-                if avg_col_diff < pr * 0.15:
-                    total_score *= 1.5
-                elif avg_col_diff < pr * 0.25:
-                    total_score *= 1.2
+                        total = 0
+                        for gx, gy in grid:
+                            ix, iy = int(gx), int(gy)
+                            patch = score[max(0, iy - sample_r):iy + sample_r + 1,
+                                          max(0, ix - sample_r):ix + sample_r + 1]
+                            total += patch.mean() if patch.size > 0 else 0
 
-            # Bonus for even column spacing within rows
-            for row in [top1, top2]:
-                if len(row) == 3:
-                    gaps = [row[1][0] - row[0][0], row[2][0] - row[1][0]]
-                    if min(gaps) > 0 and max(gaps) / min(gaps) < 2.0:
-                        total_score *= 1.3
+                        if total > best_total:
+                            best_total = total
+                            best_grid = grid
+                            best_params = (angle_deg, col_space, row_space, cx_off, cy_off)
 
-            if total_score > best_score:
-                best_score = total_score
-                best_grid = grid
+    if best_params is None:
+        return []
 
-    if best_grid is None:
-        # Fallback: just return top 6 candidates
-        return [(c[0], c[1]) for c in candidates[:6]]
+    # Fine refinement around best coarse parameters
+    angle_deg, col_space, row_space, cx_off, cy_off = best_params
+    refine_space = max(1, int(pr * 0.03))
+    refine_center = max(1, int(pr * 0.05))
 
-    return [(c[0], c[1]) for c in best_grid]
+    for a_fine in range(angle_deg - 8, angle_deg + 9, 2):
+        angle = math.radians(a_fine)
+        ca, sa = math.cos(angle), math.sin(angle)
+
+        for cs in range(col_space - refine_space * 2, col_space + refine_space * 2 + 1, refine_space):
+            for rs in range(row_space - refine_space * 2, row_space + refine_space * 2 + 1, refine_space):
+                if rs < cs * 0.35:
+                    continue
+                for cxf in range(cx_off - refine_center, cx_off + refine_center + 1,
+                                 max(1, refine_center // 2)):
+                    for cyf in range(cy_off - refine_center, cy_off + refine_center + 1,
+                                     max(1, refine_center // 2)):
+                        gcx = pcx + cxf
+                        gcy = pcy + cyf
+
+                        grid = []
+                        all_inside = True
+                        for row in range(2):
+                            for col in range(3):
+                                gx = gcx + (col - 1) * cs * ca + (row - 0.5) * rs * (-sa)
+                                gy = gcy + (col - 1) * cs * sa + (row - 0.5) * rs * ca
+                                d = math.sqrt((gx - pcx) ** 2 + (gy - pcy) ** 2)
+                                if d > pr * 0.80 or gx < 0 or gx >= w or gy < 0 or gy >= h:
+                                    all_inside = False
+                                    break
+                                grid.append((gx, gy))
+                            if not all_inside:
+                                break
+
+                        if not all_inside or len(grid) != 6:
+                            continue
+
+                        total = 0
+                        for gx, gy in grid:
+                            ix, iy = int(gx), int(gy)
+                            patch = score[max(0, iy - sample_r):iy + sample_r + 1,
+                                          max(0, ix - sample_r):ix + sample_r + 1]
+                            total += patch.mean() if patch.size > 0 else 0
+
+                        if total > best_total:
+                            best_total = total
+                            best_grid = grid
+
+    # Snap each grid point to the nearest local peak in the score map
+    if best_grid:
+        snapped = []
+        for gx, gy in best_grid:
+            sx, sy = snap_to_peak(score, gx, gy, 30)
+            snapped.append((sx, sy))
+        return snapped
+
+    return []
 
 
 def estimate_spot_radius(diff, x, y, default=30):
@@ -224,12 +253,11 @@ def estimate_spot_radius(diff, x, y, default=30):
 def find_spots_on_plate(gray, rgb, plate, sensitivity=5.0):
     """Find up to 6 spots on a plate in a 2x3 grid arrangement."""
     score, diff, median = build_spot_score_map(gray, rgb, plate)
-    candidates = find_local_maxima(score, plate)
 
-    if not candidates:
+    grid_positions = fit_2x3_grid(score, plate)
+
+    if not grid_positions:
         return [], diff, median
-
-    grid_positions = fit_2x3_grid(candidates, plate)
 
     # Estimate radius for each spot
     radii = []
@@ -328,31 +356,13 @@ def run_detection(rgb, gray, sensitivity=5.0):
             spots.append({"x": x, "y": y, "radius": radius,
                           "plate_idx": pi, "label": ""})
 
-    # Assign row/col based on position within each plate
+    # Row/col is assigned from grid order: first 3 = row 0, next 3 = row 1
+    # (the parametric grid search returns spots in R1C1, R1C2, R1C3, R2C1, R2C2, R2C3 order)
     for pi in range(len(plates)):
         plate_spots = [(i, s) for i, s in enumerate(spots) if s["plate_idx"] == pi]
-        if len(plate_spots) < 2:
-            for i, s in plate_spots:
-                s["row"] = 0
-                s["col"] = 0
-            continue
-
-        # Split into 2 rows by Y
-        ys = sorted(set(s["y"] for _, s in plate_spots))
-        if len(ys) >= 2:
-            mid_y = (min(ys) + max(ys)) / 2
-        else:
-            mid_y = ys[0]
-
-        for i, s in plate_spots:
-            s["row"] = 0 if s["y"] < mid_y else 1
-
-        # Assign columns by X position within each row
-        for row in [0, 1]:
-            row_spots = [(i, s) for i, s in plate_spots if s["row"] == row]
-            row_spots.sort(key=lambda x: x[1]["x"])
-            for col, (i, s) in enumerate(row_spots):
-                s["col"] = col
+        for idx_in_plate, (i, s) in enumerate(plate_spots):
+            s["row"] = idx_in_plate // 3
+            s["col"] = idx_in_plate % 3
 
     spots.sort(key=lambda s: (s["plate_idx"], s["row"], s["col"]))
     return plates, spots, diff_cache, median_cache
