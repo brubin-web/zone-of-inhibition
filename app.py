@@ -80,6 +80,18 @@ def build_spot_score_map(gray, rgb, plate):
     return score, diff, median
 
 
+def score_grid_position(score, x, y, radius=25):
+    """Get the peak score within radius of a grid position."""
+    h, w = score.shape
+    ix, iy = int(x), int(y)
+    y1 = max(0, iy - radius)
+    y2 = min(h, iy + radius + 1)
+    x1 = max(0, ix - radius)
+    x2 = min(w, ix + radius + 1)
+    patch = score[y1:y2, x1:x2]
+    return float(patch.max()) if patch.size > 0 else 0.0
+
+
 def snap_to_peak(score, x, y, radius=30):
     """Snap position to the highest score point within radius."""
     h, w = score.shape
@@ -97,135 +109,50 @@ def snap_to_peak(score, x, y, radius=30):
     return best_x, best_y
 
 
-def fit_2x3_grid(score, plate):
-    """Find the best 2x3 grid on the plate using parametric search.
-    Searches over grid center, rotation, column spacing, and row spacing
-    to find the arrangement that maximizes total score map signal.
-    Returns list of up to 6 (x, y) positions."""
+def find_clear_spots(score, plate, min_distance=80, max_count=6):
+    """Find clearly visible spots on a plate using local maxima detection.
+    Returns only spots with strong signal — doesn't force a specific count."""
     pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
+    rim_limit = pr * 0.78
     h, w = score.shape
 
-    best_total = -1
-    best_grid = None
-    best_params = None
+    # Use non-maximum suppression to find peaks
+    ks = min_distance if min_distance % 2 == 1 else min_distance + 1
+    dilated = cv2.dilate(score, np.ones((ks, ks)))
+    local_max = (score == dilated) & (score > 0.5)
 
-    # Coarse search over grid parameters
-    min_col = int(pr * 0.25)
-    max_col = int(pr * 0.55)
-    step_col = max(1, int(pr * 0.05))
+    ys, xs = np.where(local_max)
+    raw = []
+    for x, y in zip(xs, ys):
+        if math.sqrt((x - pcx) ** 2 + (y - pcy) ** 2) < rim_limit:
+            raw.append((int(x), int(y), float(score[y, x])))
+    raw.sort(key=lambda c: -c[2])
 
-    min_row = int(pr * 0.15)
-    max_row = int(pr * 0.45)
-    step_row = max(1, int(pr * 0.05))
-
-    center_range = int(pr * 0.25)
-    center_step = max(1, int(pr * 0.08))
-
-    sample_r = 12  # radius for scoring each grid point
-
-    for angle_deg in range(0, 180, 10):
-        angle = math.radians(angle_deg)
-        ca, sa = math.cos(angle), math.sin(angle)
-
-        for col_space in range(min_col, max_col + 1, step_col):
-            for row_space in range(min_row, max_row + 1, step_row):
-                if row_space < col_space * 0.35:
-                    continue
-
-                for cx_off in range(-center_range, center_range + 1, center_step):
-                    for cy_off in range(-center_range, center_range + 1, center_step):
-                        gcx = pcx + cx_off
-                        gcy = pcy + cy_off
-
-                        grid = []
-                        all_inside = True
-                        for row in range(2):
-                            for col in range(3):
-                                gx = gcx + (col - 1) * col_space * ca + (row - 0.5) * row_space * (-sa)
-                                gy = gcy + (col - 1) * col_space * sa + (row - 0.5) * row_space * ca
-                                d = math.sqrt((gx - pcx) ** 2 + (gy - pcy) ** 2)
-                                if d > pr * 0.80 or gx < 0 or gx >= w or gy < 0 or gy >= h:
-                                    all_inside = False
-                                    break
-                                grid.append((gx, gy))
-                            if not all_inside:
-                                break
-
-                        if not all_inside or len(grid) != 6:
-                            continue
-
-                        total = 0
-                        for gx, gy in grid:
-                            ix, iy = int(gx), int(gy)
-                            patch = score[max(0, iy - sample_r):iy + sample_r + 1,
-                                          max(0, ix - sample_r):ix + sample_r + 1]
-                            total += patch.mean() if patch.size > 0 else 0
-
-                        if total > best_total:
-                            best_total = total
-                            best_grid = grid
-                            best_params = (angle_deg, col_space, row_space, cx_off, cy_off)
-
-    if best_params is None:
+    if not raw:
         return []
 
-    # Fine refinement around best coarse parameters
-    angle_deg, col_space, row_space, cx_off, cy_off = best_params
-    refine_space = max(1, int(pr * 0.03))
-    refine_center = max(1, int(pr * 0.05))
+    # Adaptive threshold: take spots that are at least 30% of the strongest signal
+    top_score = raw[0][2]
+    threshold = top_score * 0.30
 
-    for a_fine in range(angle_deg - 8, angle_deg + 9, 2):
-        angle = math.radians(a_fine)
-        ca, sa = math.cos(angle), math.sin(angle)
+    selected = []
+    for c in raw:
+        if c[2] < threshold:
+            break
+        too_close = any(math.sqrt((c[0] - s[0]) ** 2 + (c[1] - s[1]) ** 2) < min_distance
+                        for s in selected)
+        if not too_close:
+            selected.append(c)
+        if len(selected) >= max_count:
+            break
 
-        for cs in range(col_space - refine_space * 2, col_space + refine_space * 2 + 1, refine_space):
-            for rs in range(row_space - refine_space * 2, row_space + refine_space * 2 + 1, refine_space):
-                if rs < cs * 0.35:
-                    continue
-                for cxf in range(cx_off - refine_center, cx_off + refine_center + 1,
-                                 max(1, refine_center // 2)):
-                    for cyf in range(cy_off - refine_center, cy_off + refine_center + 1,
-                                     max(1, refine_center // 2)):
-                        gcx = pcx + cxf
-                        gcy = pcy + cyf
+    # Snap each to its peak
+    final = []
+    for x, y, sc in selected:
+        sx, sy = snap_to_peak(score, x, y, 30)
+        final.append((sx, sy, sc))
 
-                        grid = []
-                        all_inside = True
-                        for row in range(2):
-                            for col in range(3):
-                                gx = gcx + (col - 1) * cs * ca + (row - 0.5) * rs * (-sa)
-                                gy = gcy + (col - 1) * cs * sa + (row - 0.5) * rs * ca
-                                d = math.sqrt((gx - pcx) ** 2 + (gy - pcy) ** 2)
-                                if d > pr * 0.80 or gx < 0 or gx >= w or gy < 0 or gy >= h:
-                                    all_inside = False
-                                    break
-                                grid.append((gx, gy))
-                            if not all_inside:
-                                break
-
-                        if not all_inside or len(grid) != 6:
-                            continue
-
-                        total = 0
-                        for gx, gy in grid:
-                            ix, iy = int(gx), int(gy)
-                            patch = score[max(0, iy - sample_r):iy + sample_r + 1,
-                                          max(0, ix - sample_r):ix + sample_r + 1]
-                            total += patch.mean() if patch.size > 0 else 0
-
-                        if total > best_total:
-                            best_total = total
-                            best_grid = grid
-
-    # Snap each grid point to the nearest local peak in the score map
-    if best_grid:
-        snapped = []
-        for gx, gy in best_grid:
-            sx, sy = snap_to_peak(score, gx, gy, 30)
-            snapped.append((sx, sy))
-        return snapped
-
-    return []
+    return final
 
 
 def estimate_spot_radius(diff, x, y, default=30):
@@ -251,32 +178,33 @@ def estimate_spot_radius(diff, x, y, default=30):
 
 
 def find_spots_on_plate(gray, rgb, plate, sensitivity=5.0):
-    """Find up to 6 spots on a plate in a 2x3 grid arrangement."""
+    """Find clearly visible spots on a plate. Returns only spots with strong signal."""
+    pr = plate["r"]
     score, diff, median = build_spot_score_map(gray, rgb, plate)
 
-    grid_positions = fit_2x3_grid(score, plate)
+    clear = find_clear_spots(score, plate,
+                             min_distance=int(pr * 0.22),
+                             max_count=6)
 
-    if not grid_positions:
+    if not clear:
         return [], diff, median
 
     # Estimate radius for each spot
     radii = []
-    for x, y in grid_positions:
+    for x, y, sc in clear:
         radii.append(estimate_spot_radius(diff, x, y))
 
-    # Enforce size similarity: use median radius for all spots
-    # (spots are pipetted with the same volume, so they should be similar size)
+    # Enforce size similarity: all drops are the same volume
     if radii:
         median_r = int(np.median(radii))
-        # Allow individual radii only if within 50% of median, otherwise use median
         spots = []
-        for (x, y), r in zip(grid_positions, radii):
+        for (x, y, sc), r in zip(clear, radii):
             if 0.5 * median_r <= r <= 1.5 * median_r:
                 spots.append((x, y, r))
             else:
                 spots.append((x, y, median_r))
     else:
-        spots = [(x, y, 30) for x, y in grid_positions]
+        spots = [(x, y, 30) for x, y, sc in clear]
 
     return spots, diff, median
 
@@ -356,13 +284,27 @@ def run_detection(rgb, gray, sensitivity=5.0):
             spots.append({"x": x, "y": y, "radius": radius,
                           "plate_idx": pi, "label": ""})
 
-    # Row/col is assigned from grid order: first 3 = row 0, next 3 = row 1
-    # (the parametric grid search returns spots in R1C1, R1C2, R1C3, R2C1, R2C2, R2C3 order)
+    # Assign row/col by clustering Y positions (row) and X positions (col)
     for pi in range(len(plates)):
         plate_spots = [(i, s) for i, s in enumerate(spots) if s["plate_idx"] == pi]
-        for idx_in_plate, (i, s) in enumerate(plate_spots):
-            s["row"] = idx_in_plate // 3
-            s["col"] = idx_in_plate % 3
+        if not plate_spots:
+            continue
+        # Sort by Y to assign rows
+        by_y = sorted(plate_spots, key=lambda t: t[1]["y"])
+        # Simple row clustering: split into groups where Y gap > 30% of plate radius
+        row_gap = plates[pi]["r"] * 0.3
+        row_id = 0
+        by_y[0][1]["row"] = 0
+        for j in range(1, len(by_y)):
+            if by_y[j][1]["y"] - by_y[j-1][1]["y"] > row_gap:
+                row_id += 1
+            by_y[j][1]["row"] = row_id
+        # Within each row, sort by X to assign columns
+        for row in range(row_id + 1):
+            row_spots = sorted([(i, s) for i, s in plate_spots if s["row"] == row],
+                               key=lambda t: t[1]["x"])
+            for col, (i, s) in enumerate(row_spots):
+                s["col"] = col
 
     spots.sort(key=lambda s: (s["plate_idx"], s["row"], s["col"]))
     return plates, spots, diff_cache, median_cache
@@ -374,17 +316,24 @@ def run_detection(rgb, gray, sensitivity=5.0):
 def get_font(size=20):
     for path in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-Bold.ttf",
     ]:
         try:
             return ImageFont.truetype(path, size)
         except (OSError, IOError):
             continue
-    return ImageFont.load_default()
+    # Pillow 10+ supports load_default with size parameter
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
-def draw_outlined_text(draw, pos, text, fill, font, outline_color="#000000", width=3):
+def draw_outlined_text(draw, pos, text, fill, font, outline_color="#000000", width=4):
     """Draw text with an outline for readability."""
     x, y = pos
     for dx in range(-width, width + 1):
@@ -399,9 +348,9 @@ def draw_annotated_image(rgb, plates, spots, selected_idx=None):
     """Draw plates, spots, zones, and labels on the image."""
     img = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(img)
-    # Scale font to image size — ~3.5% of image height for visibility
-    font_size = max(36, int(rgb.shape[0] * 0.035))
-    small_size = max(28, int(font_size * 0.7))
+    # Scale font to image size — 4% of image height for visibility
+    font_size = max(48, int(rgb.shape[0] * 0.04))
+    small_size = max(36, int(font_size * 0.75))
     font = get_font(font_size)
     small_font = get_font(small_size)
 
