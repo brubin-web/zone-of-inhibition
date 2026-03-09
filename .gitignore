@@ -1,0 +1,23 @@
+# Image files (too large for git)
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+
+# Output files
+measurements_*.csv
+annotated_*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
