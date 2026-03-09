@@ -63,31 +63,61 @@ def find_spots_in_plate(gray, rgb, plate, sensitivity=5.0):
     diff = median.astype(np.float32) - bg.astype(np.float32)
     diff[mask == 0] = 0
 
-    all_contours = []
-    for sign in [1, -1]:
-        directed = sign * diff
-        thresh_img = np.zeros(gray.shape, dtype=np.uint8)
-        thresh_img[directed > sensitivity] = 255
-        thresh_img[mask == 0] = 0
-        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        opened = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, k5)
-        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE,
-                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 300 or area > 80000:
-                continue
-            (x, y), radius = cv2.minEnclosingCircle(c)
-            circ = area / (math.pi * radius ** 2) if radius > 0 else 0
-            if circ < 0.35 or radius < 10:
-                continue
-            contour_mask = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.drawContours(contour_mask, [c], -1, 255, -1)
-            mean_diff = abs(diff[contour_mask > 0].mean())
-            if mean_diff > sensitivity * 0.6:
-                all_contours.append((int(x), int(y), int(radius), circ, mean_diff))
+    # Also compute HSV hue-based difference for better spot detection
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    hue_blur = cv2.GaussianBlur(hue, (21, 21), 5)
+    hue_bg = cv2.GaussianBlur(hue_blur, (201, 201), 60)
+    hue_diff = hue_blur - hue_bg
+    hue_diff[mask == 0] = 0
+    sat_blur = cv2.GaussianBlur(sat, (21, 21), 5)
+    sat_bg = cv2.GaussianBlur(sat_blur, (201, 201), 60)
+    sat_diff = sat_blur - sat_bg
+    sat_diff[mask == 0] = 0
 
+    all_contours = []
+
+    def _find_contours_from(diff_img, threshold_val, min_strength):
+        """Extract circular contours from a difference image."""
+        found = []
+        for sign in [1, -1]:
+            directed = sign * diff_img
+            thresh_img = np.zeros(gray.shape, dtype=np.uint8)
+            thresh_img[directed > threshold_val] = 255
+            thresh_img[mask == 0] = 0
+            k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            opened = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, k5)
+            closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE,
+                                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < 200 or area > 100000:
+                    continue
+                (x, y), radius = cv2.minEnclosingCircle(c)
+                circ = area / (math.pi * radius ** 2) if radius > 0 else 0
+                if circ < 0.3 or radius < 8:
+                    continue
+                contour_mask = np.zeros(gray.shape, dtype=np.uint8)
+                cv2.drawContours(contour_mask, [c], -1, 255, -1)
+                mean_val = abs(diff_img[contour_mask > 0].mean())
+                if mean_val > min_strength:
+                    found.append((int(x), int(y), int(radius), circ, mean_val))
+        return found
+
+    # Grayscale detection at multiple sensitivity levels
+    for s_mult in [1.0, 0.7, 0.5]:
+        thresh = sensitivity * s_mult
+        all_contours.extend(_find_contours_from(diff, thresh, thresh * 0.5))
+
+    # HSV hue detection — spots often have a distinct hue shift
+    all_contours.extend(_find_contours_from(hue_diff, 2.0, 1.0))
+
+    # HSV saturation detection — spots may differ in saturation
+    all_contours.extend(_find_contours_from(sat_diff, 5.0, 3.0))
+
+    # Merge duplicates (same spot found by multiple methods)
     merged = []
     used = set()
     all_contours.sort(key=lambda s: -(s[3] * s[4]))
@@ -104,15 +134,35 @@ def find_spots_in_plate(gray, rgb, plate, sensitivity=5.0):
 
 
 def filter_spots_by_size(spots):
-    if len(spots) < 4:
+    if len(spots) < 3:
         return spots
     radii = sorted([s["radius"] for s in spots])
-    q75 = radii[int(len(radii) * 0.75)]
-    min_r = q75 * 0.5
+
+    # Find a gap that separates small artifacts from real spots.
+    # Look for the first large relative gap (>50%) that keeps a reasonable
+    # number of spots — artifacts cluster at small radii, real spots are bigger.
+    best_cutoff = 0
+    for i in range(1, len(radii)):
+        gap = radii[i] - radii[i - 1]
+        rel_gap = gap / max(radii[i - 1], 1)
+        remaining = len(radii) - i
+        # Need: big relative gap, absolute gap >= 4px, keeps at least 15% of spots
+        if rel_gap > 0.5 and gap >= 4 and remaining >= max(3, len(radii) * 0.15):
+            best_cutoff = (radii[i - 1] + radii[i]) / 2
+            break  # Take the first qualifying gap (lowest cutoff)
+
+    if best_cutoff > 0:
+        filtered = [s for s in spots if s["radius"] >= best_cutoff]
+        if len(filtered) >= 3:
+            return filtered
+
+    # Fallback: use max radius as reference
+    max_r = radii[-1]
+    min_r = max_r * 0.4
     filtered = [s for s in spots if s["radius"] >= min_r]
-    if len(filtered) < len(spots) * 0.4:
-        return spots
-    return filtered
+    if len(filtered) >= 3:
+        return filtered
+    return spots
 
 
 def measure_spot(gray_clean, diff, spot, plate):
@@ -214,12 +264,15 @@ def draw_annotated_image(rgb, plates, spots, selected_idx=None):
     """Draw plates, spots, zones, and labels on the image."""
     img = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(img)
-    font = get_font(20)
-    small_font = get_font(16)
+    # Scale font to image size — aim for ~1.5% of image height
+    font_size = max(24, int(rgb.shape[0] * 0.015))
+    small_size = max(20, int(font_size * 0.8))
+    font = get_font(font_size)
+    small_font = get_font(small_size)
 
     for plate in plates:
         cx, cy, r = plate["cx"], plate["cy"], plate["r"]
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline="#00C800", width=3)
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline="#00C800", width=4)
 
     for i, s in enumerate(spots):
         x, y, r = s["x"], s["y"], s["radius"]
@@ -227,30 +280,31 @@ def draw_annotated_image(rgb, plates, spots, selected_idx=None):
 
         # Spot circle
         spot_color = "#FFD700" if i == selected_idx else "#66FF66"
-        spot_width = 4 if i == selected_idx else 2
+        spot_width = 5 if i == selected_idx else 3
         draw.ellipse([x - r, y - r, x + r, y + r], outline=spot_color, width=spot_width)
 
         # Zone boundary
         if zone_r > r + 2:
             zone_color = "#FF8800" if i == selected_idx else "#FF4444"
             draw.ellipse([x - zone_r, y - zone_r, x + zone_r, y + zone_r],
-                         outline=zone_color, width=2)
+                         outline=zone_color, width=3)
 
         # Center dot
-        draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(50, 100, 255))
+        draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(50, 100, 255))
 
         # Label
-        tx = x + max(r, zone_r) + 8
-        # Background box for readability
+        tx = x + max(r, zone_r) + 10
         num_text = f"#{i+1}"
         label = s.get("label", "")
-        box_h = 22 + (18 if label else 0)
-        box_w = max(len(num_text), len(label)) * 11 + 8
-        draw.rectangle([tx - 2, y - 14, tx + box_w, y - 14 + box_h],
+        line_h = font_size + 4
+        small_h = small_size + 4
+        box_h = line_h + (small_h if label else 0) + 4
+        box_w = max(len(num_text), len(label)) * int(font_size * 0.65) + 12
+        draw.rectangle([tx - 4, y - line_h // 2 - 2, tx + box_w, y - line_h // 2 + box_h],
                        fill="rgba(0,0,0,180)" if i != selected_idx else "rgba(80,60,0,200)")
-        draw.text((tx + 2, y - 12), num_text, fill="#FFFF00", font=font)
+        draw.text((tx + 2, y - line_h // 2), num_text, fill="#FFFF00", font=font)
         if label:
-            draw.text((tx + 2, y + 8), label, fill="#FFFFFF", font=small_font)
+            draw.text((tx + 2, y - line_h // 2 + line_h), label, fill="#FFFFFF", font=small_font)
 
     return img
 
