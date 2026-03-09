@@ -216,46 +216,40 @@ def get_font():
     return ImageFont.load_default()
 
 
-def draw_background(rgb, plates, spots, scale):
-    """Draw plate outlines, zone rings, labels, and spot numbers on the background.
-    The draggable circles are handled by the canvas — this is everything else."""
+def make_static_background(rgb, plates, scale):
+    """Draw ONLY the plate image + plate outlines. This never changes after
+    initial detection, so the canvas background stays stable (no flicker)."""
     h, w = rgb.shape[:2]
     dw, dh = int(w / scale), int(h / scale)
     img = Image.fromarray(rgb).resize((dw, dh), Image.LANCZOS)
     draw = ImageDraw.Draw(img)
-    font = get_font()
-
-    # Plate outlines
     for plate in plates:
         cx, cy, r = plate["cx"] / scale, plate["cy"] / scale, plate["r"] / scale
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline="#00C800", width=2)
+    return img
 
-    # Zone boundaries + labels + numbers (everything except the draggable circle)
+
+def draw_full_annotation(rgb, plates, spots):
+    """Full-resolution annotated image for download (not used for canvas)."""
+    img = Image.fromarray(rgb.copy())
+    draw = ImageDraw.Draw(img)
+    font = get_font()
+    for plate in plates:
+        cx, cy, r = plate["cx"], plate["cy"], plate["r"]
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline="#00C800", width=3)
     for i, s in enumerate(spots):
-        x, y, r = s["x"] / scale, s["y"] / scale, s["radius"] / scale
-        zone_r = s.get("zone_radius", s["radius"]) / scale
-
-        # Zone boundary (red ring)
+        x, y, r = s["x"], s["y"], s["radius"]
+        zone_r = s.get("zone_radius", r)
+        draw.ellipse([x - r, y - r, x + r, y + r], outline="#66FF66", width=3)
         if zone_r > r + 2:
             draw.ellipse([x - zone_r, y - zone_r, x + zone_r, y + zone_r],
                          outline="#FF4444", width=2)
-
-        # Spot number
-        num = f"#{i + 1}"
-        tx = x + max(r, zone_r) + 4
-        ty = y - 10
-        draw.rectangle([tx - 1, ty - 1, tx + 30, ty + 18], fill="#000000")
-        draw.text((tx + 1, ty), num, fill="#FFFF00", font=font)
-
-        # Label
+        draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=(50, 100, 255))
+        tx = x + max(r, zone_r) + 6
+        draw.text((tx, y - 12), f"#{i+1}", fill="#FFFF00", font=font)
         label = s.get("label", "")
         if label:
-            lx = x + max(r, zone_r) + 4
-            ly = y + 10
-            tw = len(label) * 10 + 6
-            draw.rectangle([lx - 1, ly - 1, lx + tw, ly + 18], fill="#000000BB")
-            draw.text((lx + 1, ly), label, fill="#FFFFFF", font=font)
-
+            draw.text((tx, y + 10), label, fill="#FFFFFF", font=font)
     return img
 
 
@@ -394,6 +388,7 @@ with st.sidebar:
                             min_value=2.0, max_value=8.0, value=5.0, step=0.5)
     if st.button("Re-detect spots", type="primary"):
         st.session_state.pop("_spots", None)
+        st.session_state.pop("_bg_img", None)
         st.session_state._canvas_version = st.session_state.get("_canvas_version", 0) + 1
 
     st.divider()
@@ -420,6 +415,7 @@ if st.session_state.get("_file_id") != file_id:
     st.session_state._rgb = rgb
     st.session_state._gray = gray
     st.session_state.pop("_spots", None)
+    st.session_state.pop("_bg_img", None)
     st.session_state._canvas_version = 0
 
 rgb = st.session_state._rgb
@@ -452,8 +448,11 @@ DISPLAY_WIDTH = min(1100, rgb.shape[1])
 scale = rgb.shape[1] / DISPLAY_WIDTH
 display_h = int(rgb.shape[0] / scale)
 
-# Background: plate image with outlines, zone rings, labels (no draggable circles)
-bg_img = draw_background(rgb, plates, spots, scale)
+# Background: plate image with plate outlines only (stable — no spot-dependent content)
+if "_bg_img" not in st.session_state or st.session_state.get("_bg_scale") != scale:
+    st.session_state._bg_img = make_static_background(rgb, plates, scale)
+    st.session_state._bg_scale = scale
+bg_img = st.session_state._bg_img
 
 # Canvas drawing mode
 if mode == "Move spots":
@@ -674,13 +673,7 @@ with c1:
                        mime="text/csv")
 with c2:
     # Build final annotated image at full resolution for download
-    final_img = draw_background(rgb, plates, spots, 1.0)  # scale=1 → full res
-    # Add the spot circles at full res
-    draw = ImageDraw.Draw(final_img)
-    for s in spots:
-        r = s["radius"]
-        draw.ellipse([s["x"] - r, s["y"] - r, s["x"] + r, s["y"] + r],
-                     outline="#66FF66", width=3)
+    final_img = draw_full_annotation(rgb, plates, spots)
     img_buf = io.BytesIO()
     final_img.save(img_buf, format="PNG")
     st.download_button("Download Annotated Image", img_buf.getvalue(),
