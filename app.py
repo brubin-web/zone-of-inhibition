@@ -13,7 +13,10 @@ import plotly.express as px
 import io
 import math
 import json
-from streamlit_drawable_canvas import st_canvas
+try:
+    from streamlit_drawable_canvas import st_canvas
+except ImportError:
+    from streamlit_drawable_canvas_fix import st_canvas
 
 
 # ─── Image Analysis ─────────────────────────────────────────────────────────
