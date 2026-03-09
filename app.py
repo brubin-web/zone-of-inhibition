@@ -1,7 +1,6 @@
 """
 Zone of Inhibition Measurement Tool — Streamlit Web App
-Drag-and-drop plate images, drag spots around on the plate, label them,
-and get measurements + summary graphs.
+Upload plate images, auto-detect spots, label them, get measurements + graphs.
 """
 
 import streamlit as st
@@ -12,11 +11,6 @@ import pandas as pd
 import plotly.express as px
 import io
 import math
-import json
-try:
-    from streamlit_drawable_canvas import st_canvas
-except ImportError:
-    from streamlit_drawable_canvas_fix import st_canvas
 
 
 # ─── Image Analysis ─────────────────────────────────────────────────────────
@@ -203,101 +197,62 @@ def run_detection(rgb, gray, sensitivity=5.0):
 # ─── Drawing ────────────────────────────────────────────────────────────────
 
 
-def get_font():
+def get_font(size=20):
     for path in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     ]:
         try:
-            return ImageFont.truetype(path, 20)
+            return ImageFont.truetype(path, size)
         except (OSError, IOError):
             continue
     return ImageFont.load_default()
 
 
-def make_static_background(rgb, plates, scale):
-    """Draw ONLY the plate image + plate outlines. This never changes after
-    initial detection, so the canvas background stays stable (no flicker)."""
-    h, w = rgb.shape[:2]
-    dw, dh = int(w / scale), int(h / scale)
-    img = Image.fromarray(rgb).resize((dw, dh), Image.LANCZOS)
-    draw = ImageDraw.Draw(img)
-    for plate in plates:
-        cx, cy, r = plate["cx"] / scale, plate["cy"] / scale, plate["r"] / scale
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline="#00C800", width=2)
-    return img
-
-
-def draw_full_annotation(rgb, plates, spots):
-    """Full-resolution annotated image for download (not used for canvas)."""
+def draw_annotated_image(rgb, plates, spots, selected_idx=None):
+    """Draw plates, spots, zones, and labels on the image."""
     img = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(img)
-    font = get_font()
+    font = get_font(20)
+    small_font = get_font(16)
+
     for plate in plates:
         cx, cy, r = plate["cx"], plate["cy"], plate["r"]
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline="#00C800", width=3)
+
     for i, s in enumerate(spots):
         x, y, r = s["x"], s["y"], s["radius"]
         zone_r = s.get("zone_radius", r)
-        draw.ellipse([x - r, y - r, x + r, y + r], outline="#66FF66", width=3)
+
+        # Spot circle
+        spot_color = "#FFD700" if i == selected_idx else "#66FF66"
+        spot_width = 4 if i == selected_idx else 2
+        draw.ellipse([x - r, y - r, x + r, y + r], outline=spot_color, width=spot_width)
+
+        # Zone boundary
         if zone_r > r + 2:
+            zone_color = "#FF8800" if i == selected_idx else "#FF4444"
             draw.ellipse([x - zone_r, y - zone_r, x + zone_r, y + zone_r],
-                         outline="#FF4444", width=2)
-        draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=(50, 100, 255))
-        tx = x + max(r, zone_r) + 6
-        draw.text((tx, y - 12), f"#{i+1}", fill="#FFFF00", font=font)
+                         outline=zone_color, width=2)
+
+        # Center dot
+        draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(50, 100, 255))
+
+        # Label
+        tx = x + max(r, zone_r) + 8
+        # Background box for readability
+        num_text = f"#{i+1}"
         label = s.get("label", "")
+        box_h = 22 + (18 if label else 0)
+        box_w = max(len(num_text), len(label)) * 11 + 8
+        draw.rectangle([tx - 2, y - 14, tx + box_w, y - 14 + box_h],
+                       fill="rgba(0,0,0,180)" if i != selected_idx else "rgba(80,60,0,200)")
+        draw.text((tx + 2, y - 12), num_text, fill="#FFFF00", font=font)
         if label:
-            draw.text((tx, y + 10), label, fill="#FFFFFF", font=font)
+            draw.text((tx + 2, y + 8), label, fill="#FFFFFF", font=small_font)
+
     return img
-
-
-def spots_to_canvas_objects(spots, scale):
-    """Convert our spot list to Fabric.js circle objects for the canvas."""
-    objects = []
-    for i, s in enumerate(spots):
-        r = s["radius"] / scale
-        objects.append({
-            "type": "circle",
-            "left": s["x"] / scale - r,
-            "top": s["y"] / scale - r,
-            "radius": r,
-            "fill": "rgba(100, 255, 100, 0.15)",
-            "stroke": "#66FF66",
-            "strokeWidth": 2,
-            "name": f"spot_{i}",
-        })
-    return {"version": "4.4.0", "objects": objects}
-
-
-def canvas_objects_to_spots(json_data, spots, scale):
-    """Read back canvas circle positions and update spot coordinates.
-    Returns True if any positions changed."""
-    if json_data is None or "objects" not in json_data:
-        return False
-    changed = False
-    canvas_objs = json_data["objects"]
-    for obj in canvas_objs:
-        name = obj.get("name", "")
-        if not name.startswith("spot_"):
-            continue
-        try:
-            idx = int(name.split("_")[1])
-        except (ValueError, IndexError):
-            continue
-        if idx >= len(spots):
-            continue
-
-        r = obj["radius"] * obj.get("scaleX", 1)
-        new_x = int((obj["left"] + r) * scale)
-        new_y = int((obj["top"] + r) * scale)
-
-        if abs(new_x - spots[idx]["x"]) > 2 or abs(new_y - spots[idx]["y"]) > 2:
-            spots[idx]["x"] = new_x
-            spots[idx]["y"] = new_y
-            changed = True
-    return changed
 
 
 def assign_plate(plates, x, y):
@@ -309,15 +264,12 @@ def assign_plate(plates, x, y):
 
 
 def cluster_1d(values, min_gap_frac=0.3):
-    """Cluster sorted 1D values into groups separated by large gaps.
-    Returns list of (cluster_center, [indices])."""
     if not values:
         return []
     indexed = sorted(enumerate(values), key=lambda iv: iv[1])
     clusters = [[indexed[0]]]
     for i in range(1, len(indexed)):
         gap = indexed[i][1] - indexed[i - 1][1]
-        # A gap > min_gap_frac of the plate radius separates clusters
         if gap > min_gap_frac:
             clusters.append([])
         clusters[-1].append(indexed[i])
@@ -331,26 +283,20 @@ def cluster_1d(values, min_gap_frac=0.3):
 
 
 def detect_grid(spots, plates):
-    """Detect row/column structure within each plate.
-    Returns spots with 'row' and 'col' assignments."""
     for plate_idx in range(len(plates)):
         plate = plates[plate_idx]
         plate_spots = [(i, s) for i, s in enumerate(spots) if s["plate_idx"] == plate_idx]
         if not plate_spots:
             continue
-
-        # Use position relative to plate center
         pr = plate["r"]
-        gap_threshold = pr * 0.08  # ~8% of plate radius separates rows/cols
+        gap_threshold = pr * 0.08
 
-        # Cluster by Y for rows
         ys = [s["y"] for _, s in plate_spots]
         y_clusters = cluster_1d(ys, gap_threshold)
         for row_idx, (_, indices) in enumerate(y_clusters):
             for idx in indices:
                 spots[plate_spots[idx][0]]["row"] = row_idx
 
-        # Cluster by X for columns
         xs = [s["x"] for _, s in plate_spots]
         x_clusters = cluster_1d(xs, gap_threshold)
         for col_idx, (_, indices) in enumerate(x_clusters):
@@ -358,6 +304,17 @@ def detect_grid(spots, plates):
                 spots[plate_spots[idx][0]]["col"] = col_idx
 
     return spots
+
+
+def remeasure_spot(spots, idx, plates):
+    """Re-measure a single spot after it's been moved."""
+    s = spots[idx]
+    pi = s["plate_idx"]
+    diff_cache = st.session_state.get("_diff", {})
+    median_cache = st.session_state.get("_median", {})
+    if pi in diff_cache:
+        m = measure_spot(median_cache[pi], diff_cache[pi], s, plates[pi])
+        s.update(m)
 
 
 # ─── Streamlit App ──────────────────────────────────────────────────────────
@@ -374,7 +331,7 @@ uploaded_file = st.file_uploader(
 if uploaded_file is None:
     st.markdown(
         "Upload an image of agar plates. The tool will detect plates and spots, "
-        "then you can **drag spots** to adjust positions, label them, and generate measurements."
+        "then you can adjust positions, label them, and generate measurements."
     )
     st.stop()
 
@@ -388,23 +345,15 @@ with st.sidebar:
                             min_value=2.0, max_value=8.0, value=5.0, step=0.5)
     if st.button("Re-detect spots", type="primary"):
         st.session_state.pop("_spots", None)
-        st.session_state.pop("_bg_img", None)
-        st.session_state._canvas_version = st.session_state.get("_canvas_version", 0) + 1
-
-    st.divider()
-    st.header("Editing")
-    mode = st.radio("Mode", ["Move spots", "Add spot"],
-                    help="**Move**: drag existing spots. **Add**: click to place a new spot.")
 
     st.divider()
     st.header("Instructions")
     st.markdown(
         "1. Upload an image\n"
         "2. Adjust sensitivity if needed\n"
-        "3. **Drag spots** to correct positions\n"
-        "4. Switch to *Add spot* mode to add missing spots\n"
-        "5. Label spots below the image\n"
-        "6. Download CSV and graphs"
+        "3. Select spots to adjust or delete\n"
+        "4. Label rows (sample) and columns (concentration)\n"
+        "5. Download CSV and graphs"
     )
 
 # ─── Load image ─────────────────────────────────────────────────────────────
@@ -415,8 +364,6 @@ if st.session_state.get("_file_id") != file_id:
     st.session_state._rgb = rgb
     st.session_state._gray = gray
     st.session_state.pop("_spots", None)
-    st.session_state.pop("_bg_img", None)
-    st.session_state._canvas_version = 0
 
 rgb = st.session_state._rgb
 gray = st.session_state._gray
@@ -439,91 +386,90 @@ if "_spots" not in st.session_state:
 plates = st.session_state._plates
 spots = st.session_state._spots
 
-# ─── Canvas ─────────────────────────────────────────────────────────────────
+# ─── Annotated Image ───────────────────────────────────────────────────────
 
-st.subheader(f"{len(plates)} plate(s), {len(spots)} spot(s) — drag to adjust")
+selected = st.session_state.get("_selected_spot", None)
+ann_img = draw_annotated_image(rgb, plates, spots, selected_idx=selected)
 
-# Scale for display
-DISPLAY_WIDTH = min(1100, rgb.shape[1])
-scale = rgb.shape[1] / DISPLAY_WIDTH
-display_h = int(rgb.shape[0] / scale)
+st.subheader(f"{len(plates)} plate(s), {len(spots)} spot(s)")
+st.image(ann_img, use_container_width=True)
 
-# Background: plate image with plate outlines only (stable — no spot-dependent content)
-if "_bg_img" not in st.session_state or st.session_state.get("_bg_scale") != scale:
-    st.session_state._bg_img = make_static_background(rgb, plates, scale)
-    st.session_state._bg_scale = scale
-bg_img = st.session_state._bg_img
+# ─── Spot Editing ──────────────────────────────────────────────────────────
 
-# Canvas drawing mode
-if mode == "Move spots":
-    drawing_mode = "transform"
-else:
-    drawing_mode = "circle"
+st.divider()
+st.subheader("Edit Spots")
 
-# Build initial drawing from spots
-canvas_version = st.session_state.get("_canvas_version", 0)
-initial = spots_to_canvas_objects(spots, scale)
+col_select, col_actions = st.columns([3, 2])
 
-canvas_result = st_canvas(
-    fill_color="rgba(100, 255, 100, 0.15)",
-    stroke_width=2,
-    stroke_color="#66FF66",
-    background_image=bg_img,
-    initial_drawing=initial,
-    update_streamlit=False,
-    height=display_h,
-    width=DISPLAY_WIDTH,
-    drawing_mode=drawing_mode,
-    key=f"canvas_{canvas_version}",
-)
+with col_select:
+    spot_options = [f"#{i+1} — Plate {s['plate_idx']+1}, "
+                    f"R{s.get('row',0)+1}C{s.get('col',0)+1}"
+                    + (f" ({s.get('label','')})" if s.get('label') else "")
+                    for i, s in enumerate(spots)]
+    if spots:
+        sel_idx = st.selectbox(
+            "Select a spot to edit",
+            range(len(spots)),
+            format_func=lambda i: spot_options[i],
+            index=selected if selected is not None and selected < len(spots) else 0,
+            key="_spot_selector"
+        )
+        if sel_idx != st.session_state.get("_selected_spot"):
+            st.session_state._selected_spot = sel_idx
+            st.rerun()
 
-# ─── Sync canvas → spots ───────────────────────────────────────────────────
+with col_actions:
+    if spots:
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            if st.button("Delete this spot", type="secondary"):
+                spots.pop(sel_idx)
+                st.session_state._spots = spots
+                st.session_state._selected_spot = max(0, sel_idx - 1) if spots else None
+                # Re-detect grid after deletion
+                spots = detect_grid(spots, plates)
+                st.session_state._spots = spots
+                st.rerun()
+        with ac2:
+            if st.button("Add spot at plate center"):
+                if plates:
+                    p = plates[0]
+                    new_spot = {"x": p["cx"], "y": p["cy"], "radius": 35,
+                                "plate_idx": 0, "label": ""}
+                    remeasure_spot([new_spot], 0, plates)
+                    spots.append(new_spot)
+                    spots.sort(key=lambda s: (s["plate_idx"], s["y"] // 50, s["x"]))
+                    spots = detect_grid(spots, plates)
+                    st.session_state._spots = spots
+                    st.session_state._selected_spot = spots.index(new_spot)
+                    st.rerun()
 
-if canvas_result.json_data is not None:
-    objects = canvas_result.json_data.get("objects", [])
+# Position adjustment for selected spot
+if spots and sel_idx is not None and sel_idx < len(spots):
+    s = spots[sel_idx]
+    st.markdown(f"**Spot #{sel_idx+1}** — Plate {s['plate_idx']+1}")
 
-    # Check for newly drawn circles (from "Add spot" mode)
-    existing_names = {f"spot_{i}" for i in range(len(spots))}
-    new_circles = [o for o in objects
-                   if o["type"] == "circle" and o.get("name", "") not in existing_names]
-    for obj in new_circles:
-        r_canvas = obj["radius"] * obj.get("scaleX", 1)
-        cx = int((obj["left"] + r_canvas) * scale)
-        cy = int((obj["top"] + r_canvas) * scale)
-        r_orig = int(r_canvas * scale)
-        if r_orig < 5:
-            r_orig = spots[0]["radius"] if spots else 35
+    p = plates[s["plate_idx"]]
+    x_min, x_max = p["cx"] - p["r"], p["cx"] + p["r"]
+    y_min, y_max = p["cy"] - p["r"], p["cy"] + p["r"]
 
-        pi = assign_plate(plates, cx, cy)
-        new_spot = {"x": cx, "y": cy, "radius": r_orig, "plate_idx": pi, "label": ""}
-        diff_cache = st.session_state._diff
-        median_cache = st.session_state._median
-        if pi in diff_cache:
-            m = measure_spot(median_cache[pi], diff_cache[pi], new_spot, plates[pi])
-            new_spot.update(m)
-        else:
-            new_spot.update({"zone_radius": r_orig, "zone_diameter": r_orig * 2,
-                             "zone_area": math.pi * r_orig ** 2, "has_zone": False,
-                             "drop_radius": 3, "drop_area": 28.3, "drop_intensity": 128.0})
-        spots.append(new_spot)
-        spots.sort(key=lambda s: (s["plate_idx"], s["y"] // 50, s["x"]))
+    c1, c2 = st.columns(2)
+    with c1:
+        new_x = st.slider("X position", min_value=x_min, max_value=x_max,
+                           value=s["x"], key=f"x_{sel_idx}")
+    with c2:
+        new_y = st.slider("Y position", min_value=y_min, max_value=y_max,
+                           value=s["y"], key=f"y_{sel_idx}")
+
+    if new_x != s["x"] or new_y != s["y"]:
+        s["x"] = new_x
+        s["y"] = new_y
+        remeasure_spot(spots, sel_idx, plates)
+        spots = detect_grid(spots, plates)
         st.session_state._spots = spots
-        st.session_state._canvas_version = canvas_version + 1
         st.rerun()
 
-    # Sync moved positions
-    if canvas_objects_to_spots(canvas_result.json_data, spots, scale):
-        # Re-measure moved spots
-        diff_cache = st.session_state._diff
-        median_cache = st.session_state._median
-        for s in spots:
-            pi = s["plate_idx"]
-            if pi in diff_cache:
-                m = measure_spot(median_cache[pi], diff_cache[pi], s, plates[pi])
-                s.update(m)
-        st.session_state._spots = spots
-
-# ─── Spot labeling (grid-based) ─────────────────────────────────────────────
+# ─── Spot Labeling (grid-based) ────────────────────────────────────────────
 
 st.divider()
 st.subheader("Label Spots")
@@ -533,11 +479,6 @@ st.markdown(
     "Label rows and columns below — each spot auto-labels from its row + column."
 )
 
-# Collect unique rows and columns across all plates
-all_rows = sorted(set(s.get("row", 0) for s in spots))
-all_cols = sorted(set(s.get("col", 0) for s in spots))
-
-# Initialize row/col labels in session state
 if "_row_labels" not in st.session_state:
     st.session_state._row_labels = {}
 if "_col_labels" not in st.session_state:
@@ -546,7 +487,6 @@ if "_col_labels" not in st.session_state:
 row_labels = st.session_state._row_labels
 col_labels = st.session_state._col_labels
 
-# Per-plate labeling
 for plate_idx in range(len(plates)):
     plate_spots = [s for s in spots if s["plate_idx"] == plate_idx]
     if not plate_spots:
@@ -558,7 +498,6 @@ for plate_idx in range(len(plates)):
     st.markdown(f"**Plate {plate_idx + 1}** — {len(plate_spots)} spots "
                 f"({len(p_rows)} rows x {len(p_cols)} columns)")
 
-    # Row labels (sample types)
     r_cols = st.columns(max(1, len(p_rows)))
     for ri, row_id in enumerate(p_rows):
         key = f"p{plate_idx}_r{row_id}"
@@ -571,7 +510,6 @@ for plate_idx in range(len(plates)):
             )
             row_labels[key] = val
 
-    # Column labels (concentrations)
     c_cols = st.columns(max(1, len(p_cols)))
     for ci, col_id in enumerate(p_cols):
         key = f"p{plate_idx}_c{col_id}"
@@ -603,19 +541,6 @@ for s in spots:
     else:
         s["label"] = ""
 st.session_state._spots = spots
-
-# Delete individual spots
-with st.expander("Delete individual spots"):
-    for i, s in enumerate(spots):
-        c1, c2 = st.columns([6, 1])
-        with c1:
-            st.text(f"#{i+1} P{s['plate_idx']+1} R{s.get('row',0)+1}C{s.get('col',0)+1} — {s.get('label','')}")
-        with c2:
-            if st.button("X", key=f"del_{i}"):
-                spots.pop(i)
-                st.session_state._spots = spots
-                st.session_state._canvas_version = canvas_version + 1
-                st.rerun()
 
 # ─── Measurements ───────────────────────────────────────────────────────────
 
@@ -672,10 +597,8 @@ with c1:
                        file_name=f"measurements_{uploaded_file.name.rsplit('.', 1)[0]}.csv",
                        mime="text/csv")
 with c2:
-    # Build final annotated image at full resolution for download
-    final_img = draw_full_annotation(rgb, plates, spots)
     img_buf = io.BytesIO()
-    final_img.save(img_buf, format="PNG")
+    ann_img.save(img_buf, format="PNG")
     st.download_button("Download Annotated Image", img_buf.getvalue(),
                        file_name=f"annotated_{uploaded_file.name.rsplit('.', 1)[0]}.png",
                        mime="image/png")
