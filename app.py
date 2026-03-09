@@ -1,6 +1,7 @@
 """
 Zone of Inhibition Measurement Tool — Streamlit Web App
-Upload plate images, auto-detect spots, label them, get measurements + graphs.
+Upload plate images, auto-detect spots (2 rows x 3 columns per plate),
+label them, get measurements + graphs.
 """
 
 import streamlit as st
@@ -47,136 +48,209 @@ def detect_plates(gray, rgb):
 def remove_pen_marks(gray, rgb, mask):
     pen_mask = np.zeros(gray.shape, dtype=np.uint8)
     r_ch, g_ch, b_ch = rgb[:, :, 0].astype(int), rgb[:, :, 1].astype(int), rgb[:, :, 2].astype(int)
-    # Blue ink (pen labels)
     pen_mask[(b_ch - r_ch > 12) & (mask > 0)] = 255
-    # Red ink (pen labels)
     pen_mask[(r_ch - g_ch > 30) & (r_ch > 150) & (mask > 0)] = 255
-    # Highly saturated colors (marker/pen) — use HSV saturation
-    # Only flag very saturated pixels (>130/255) to avoid removing real plate features
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     pen_mask[(hsv[:, :, 1] > 130) & (mask > 0)] = 255
     pen_mask = cv2.dilate(pen_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
     return cv2.inpaint(gray, pen_mask, 25, cv2.INPAINT_TELEA)
 
 
-def find_spots_in_plate(gray, rgb, plate, sensitivity=5.0):
+def build_spot_score_map(gray, rgb, plate):
+    """Build a map where each pixel's value indicates how spot-like the area is.
+    Uses background subtraction + matched circular filter."""
     pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
     mask = np.zeros(gray.shape, dtype=np.uint8)
-    cv2.circle(mask, (pcx, pcy), pr - 70, 255, -1)
+    cv2.circle(mask, (pcx, pcy), int(pr * 0.82), 255, -1)
+
     clean = remove_pen_marks(gray, rgb, mask)
     median = cv2.medianBlur(clean, 21)
     bg = cv2.GaussianBlur(median, (201, 201), 60)
     diff = median.astype(np.float32) - bg.astype(np.float32)
     diff[mask == 0] = 0
 
-    # Also compute HSV hue-based difference for better spot detection
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-    hue = hsv[:, :, 0]
-    sat = hsv[:, :, 1]
-    hue_blur = cv2.GaussianBlur(hue, (21, 21), 5)
-    hue_bg = cv2.GaussianBlur(hue_blur, (201, 201), 60)
-    hue_diff = hue_blur - hue_bg
-    hue_diff[mask == 0] = 0
-    sat_blur = cv2.GaussianBlur(sat, (21, 21), 5)
-    sat_bg = cv2.GaussianBlur(sat_blur, (201, 201), 60)
-    sat_diff = sat_blur - sat_bg
-    sat_diff[mask == 0] = 0
+    # Absolute difference — spots show up as either lighter or darker than background
+    abs_diff = np.abs(diff)
 
-    # Rim exclusion: reject spots within 15% of plate edge
-    rim_limit = pr * 0.85
+    # Matched filter: smooth with a Gaussian the size of a typical spot (~25px)
+    # This boosts real spots (coherent circular signal) and suppresses noise/streaks
+    score = cv2.GaussianBlur(abs_diff, (51, 51), 20)
+    score[mask == 0] = 0
 
-    all_contours = []
-
-    def _find_contours_from(diff_img, threshold_val, min_strength):
-        """Extract circular contours from a difference image."""
-        found = []
-        for sign in [1, -1]:
-            directed = sign * diff_img
-            thresh_img = np.zeros(gray.shape, dtype=np.uint8)
-            thresh_img[directed > threshold_val] = 255
-            thresh_img[mask == 0] = 0
-            k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            opened = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, k5)
-            closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE,
-                                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
-            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for c in contours:
-                area = cv2.contourArea(c)
-                if area < 300 or area > 100000:
-                    continue
-                (x, y), radius = cv2.minEnclosingCircle(c)
-                circ = area / (math.pi * radius ** 2) if radius > 0 else 0
-                if circ < 0.4 or radius < 10:
-                    continue
-                # Reject spots too close to plate rim
-                dist_from_center = math.sqrt((x - pcx) ** 2 + (y - pcy) ** 2)
-                if dist_from_center > rim_limit:
-                    continue
-                contour_mask = np.zeros(gray.shape, dtype=np.uint8)
-                cv2.drawContours(contour_mask, [c], -1, 255, -1)
-                mean_val = abs(diff_img[contour_mask > 0].mean())
-                if mean_val > min_strength:
-                    found.append((int(x), int(y), int(radius), circ, mean_val))
-        return found
-
-    # Grayscale detection at two sensitivity levels
-    for s_mult in [1.0, 0.7]:
-        thresh = sensitivity * s_mult
-        all_contours.extend(_find_contours_from(diff, thresh, thresh * 0.6))
-
-    # HSV hue detection — spots often have a distinct hue shift
-    all_contours.extend(_find_contours_from(hue_diff, 3.0, 1.5))
-
-    # HSV saturation detection — spots may differ in saturation
-    all_contours.extend(_find_contours_from(sat_diff, 8.0, 4.0))
-
-    # Merge duplicates (same spot found by multiple methods)
-    merged = []
-    used = set()
-    all_contours.sort(key=lambda s: -(s[3] * s[4]))
-    for i, item in enumerate(all_contours):
-        if i in used:
-            continue
-        for j, other in enumerate(all_contours):
-            if j != i and j not in used:
-                if abs(item[0] - other[0]) < 60 and abs(item[1] - other[1]) < 60:
-                    used.add(j)
-        used.add(i)
-        merged.append(item)
-    return merged, diff, median
+    return score, diff, median
 
 
-def filter_spots_by_size(spots):
-    if len(spots) < 3:
-        return spots
-    radii = sorted([s["radius"] for s in spots])
+def find_local_maxima(score, plate, min_distance=60, max_candidates=30):
+    """Find local maxima in the score map within the plate."""
+    pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
+    rim_limit = pr * 0.78
 
-    # Find the largest relative gap — if it's really clear (>80% jump),
-    # use it to separate artifacts from real spots
-    best_gap_rel = 0
-    best_cutoff = 0
-    for i in range(1, len(radii)):
-        gap = radii[i] - radii[i - 1]
-        rel_gap = gap / max(radii[i - 1], 1)
-        remaining = len(radii) - i
-        if rel_gap > best_gap_rel and gap >= 5 and remaining >= 3:
-            best_gap_rel = rel_gap
-            best_cutoff = (radii[i - 1] + radii[i]) / 2
+    # Dilate and compare to find local maxima
+    kernel_size = min_distance
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    dilated = cv2.dilate(score, np.ones((kernel_size, kernel_size)))
+    local_max = (score == dilated) & (score > 0.5)
 
-    # Only use gap filter if the gap is very obvious (>80% size jump)
-    if best_cutoff > 0 and best_gap_rel > 0.8:
-        filtered = [s for s in spots if s["radius"] >= best_cutoff]
-        if len(filtered) >= 3:
-            return filtered
+    ys, xs = np.where(local_max)
+    candidates = []
+    for x, y in zip(xs, ys):
+        dist = math.sqrt((x - pcx) ** 2 + (y - pcy) ** 2)
+        if dist < rim_limit:
+            candidates.append((int(x), int(y), float(score[y, x])))
 
-    # Fallback: keep spots with radius >= 35% of the 80th-percentile spot
-    # (using percentile instead of max to be robust against outliers)
-    ref_r = radii[min(int(len(radii) * 0.8), len(radii) - 1)]
-    min_r = ref_r * 0.35
-    filtered = [s for s in spots if s["radius"] >= min_r]
-    if len(filtered) >= 3:
-        return filtered
-    return spots
+    # Sort by score descending, take top N
+    candidates.sort(key=lambda c: -c[2])
+    return candidates[:max_candidates]
+
+
+def fit_2x3_grid(candidates, plate):
+    """Given candidate spot positions, find the best 2x3 grid arrangement.
+    Returns list of 6 (or fewer) (x, y) positions.
+
+    Strategy:
+    1. Cluster candidate Y positions into 2 rows
+    2. Within each row, pick the 3 strongest candidates with reasonable spacing
+    3. Validate column alignment between rows
+    """
+    if len(candidates) < 3:
+        return [(c[0], c[1]) for c in candidates]
+
+    pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
+    min_row_gap = pr * 0.15  # Minimum Y gap between the two rows
+
+    # Try to find 2 rows by clustering Y coordinates
+    ys = sorted(set(c[1] for c in candidates))
+
+    best_grid = None
+    best_score = -1
+
+    # Try different Y-splits to find the two rows
+    for split_y in range(len(ys)):
+        for next_y in range(split_y + 1, len(ys)):
+            if ys[next_y] - ys[split_y] < min_row_gap:
+                continue
+
+            # Split candidates into row1 (above split) and row2 (below split)
+            mid_y = (ys[split_y] + ys[next_y]) / 2
+            row1 = [c for c in candidates if c[1] < mid_y]
+            row2 = [c for c in candidates if c[1] >= mid_y]
+
+            if not row1 or not row2:
+                continue
+
+            # Further cluster within each group — take candidates near the
+            # dominant Y of each group
+            r1_y = np.median([c[1] for c in row1])
+            r2_y = np.median([c[1] for c in row2])
+            row1 = [c for c in row1 if abs(c[1] - r1_y) < pr * 0.12]
+            row2 = [c for c in row2 if abs(c[1] - r2_y) < pr * 0.12]
+
+            if len(row1) < 1 or len(row2) < 1:
+                continue
+
+            # Pick best 3 from each row (sorted by score)
+            row1.sort(key=lambda c: -c[2])
+            row2.sort(key=lambda c: -c[2])
+            top1 = row1[:3]
+            top2 = row2[:3]
+
+            # Sort each row by X
+            top1.sort(key=lambda c: c[0])
+            top2.sort(key=lambda c: c[0])
+
+            grid = top1 + top2
+            total_score = sum(c[2] for c in grid)
+
+            # Bonus for having 3 per row
+            if len(top1) == 3:
+                total_score *= 1.2
+            if len(top2) == 3:
+                total_score *= 1.2
+
+            # Bonus for column alignment between rows
+            if len(top1) >= 2 and len(top2) >= 2:
+                # Check if X positions roughly match between rows
+                col_diffs = []
+                for c1 in top1:
+                    closest = min(top2, key=lambda c2: abs(c2[0] - c1[0]))
+                    col_diffs.append(abs(closest[0] - c1[0]))
+                avg_col_diff = np.mean(col_diffs)
+                if avg_col_diff < pr * 0.15:
+                    total_score *= 1.5
+                elif avg_col_diff < pr * 0.25:
+                    total_score *= 1.2
+
+            # Bonus for even column spacing within rows
+            for row in [top1, top2]:
+                if len(row) == 3:
+                    gaps = [row[1][0] - row[0][0], row[2][0] - row[1][0]]
+                    if min(gaps) > 0 and max(gaps) / min(gaps) < 2.0:
+                        total_score *= 1.3
+
+            if total_score > best_score:
+                best_score = total_score
+                best_grid = grid
+
+    if best_grid is None:
+        # Fallback: just return top 6 candidates
+        return [(c[0], c[1]) for c in candidates[:6]]
+
+    return [(c[0], c[1]) for c in best_grid]
+
+
+def estimate_spot_radius(diff, x, y, default=30):
+    """Estimate the radius of a spot at (x, y) from the diff image."""
+    h, w = diff.shape
+    profile = []
+    for r in range(1, 60):
+        na = max(12, int(2 * math.pi * r))
+        angles = np.linspace(0, 2 * math.pi, na, endpoint=False)
+        pxs = np.clip((x + r * np.cos(angles)).astype(int), 0, w - 1)
+        pys = np.clip((y + r * np.sin(angles)).astype(int), 0, h - 1)
+        profile.append(abs(diff[pys, pxs].mean()))
+    if not profile:
+        return default
+    peak = max(profile[:30])
+    if peak < 1.0:
+        return default
+    threshold = peak * 0.3
+    for r_idx, val in enumerate(profile):
+        if r_idx > 5 and val < threshold:
+            return max(15, r_idx + 1)
+    return default
+
+
+def find_spots_on_plate(gray, rgb, plate, sensitivity=5.0):
+    """Find up to 6 spots on a plate in a 2x3 grid arrangement."""
+    score, diff, median = build_spot_score_map(gray, rgb, plate)
+    candidates = find_local_maxima(score, plate)
+
+    if not candidates:
+        return [], diff, median
+
+    grid_positions = fit_2x3_grid(candidates, plate)
+
+    # Estimate radius for each spot
+    radii = []
+    for x, y in grid_positions:
+        radii.append(estimate_spot_radius(diff, x, y))
+
+    # Enforce size similarity: use median radius for all spots
+    # (spots are pipetted with the same volume, so they should be similar size)
+    if radii:
+        median_r = int(np.median(radii))
+        # Allow individual radii only if within 50% of median, otherwise use median
+        spots = []
+        for (x, y), r in zip(grid_positions, radii):
+            if 0.5 * median_r <= r <= 1.5 * median_r:
+                spots.append((x, y, r))
+            else:
+                spots.append((x, y, median_r))
+    else:
+        spots = [(x, y, 30) for x, y in grid_positions]
+
+    return spots, diff, median
 
 
 def measure_spot(gray_clean, diff, spot, plate):
@@ -241,185 +315,47 @@ def measure_spot(gray_clean, diff, spot, plate):
     }
 
 
-def infer_grid(plate_spots, plate):
-    """Given detected spots on one plate, infer the grid structure.
-    Returns (row_positions, col_positions) — only rows/columns with
-    at least 2 spots in them (to avoid false grid lines)."""
-    if len(plate_spots) < 4:
-        return [], []
-
-    pr = plate["r"]
-    gap_threshold = pr * 0.12
-
-    ys = [s["y"] for s in plate_spots]
-    xs = [s["x"] for s in plate_spots]
-
-    def _cluster(vals):
-        sorted_vals = sorted(vals)
-        groups = [[sorted_vals[0]]]
-        for i in range(1, len(sorted_vals)):
-            if sorted_vals[i] - sorted_vals[i - 1] > gap_threshold:
-                groups.append([])
-            groups[-1].append(sorted_vals[i])
-        # Only keep clusters with >= 2 members (real grid lines have multiple spots)
-        return [np.mean(g) for g in groups if len(g) >= 2]
-
-    return _cluster(ys), _cluster(xs)
-
-
-def find_spot_at_position(diff, median, ex, ey, search_radius, plate, min_signal=3.0):
-    """Search for a spot at an expected grid position.
-    Returns (x, y, radius) or None. Requires meaningful signal."""
-    pcx, pcy, pr = plate["cx"], plate["cy"], plate["r"]
-    h, w = diff.shape
-
-    if math.sqrt((ex - pcx) ** 2 + (ey - pcy) ** 2) > pr * 0.82:
-        return None
-
-    sr = search_radius
-    x1, x2 = max(0, ex - sr), min(w, ex + sr)
-    y1, y2 = max(0, ey - sr), min(h, ey + sr)
-
-    if x2 - x1 < 10 or y2 - y1 < 10:
-        return None
-
-    # Find the peak signal in the search area
-    abs_diff_region = np.abs(diff[y1:y2, x1:x2])
-    max_loc = np.unravel_index(abs_diff_region.argmax(), abs_diff_region.shape)
-    best_y = y1 + max_loc[0]
-    best_x = x1 + max_loc[1]
-
-    # Measure radial profile from the peak to check if it looks like a real spot
-    profile = []
-    for r in range(1, min(sr, 50)):
-        na = max(12, int(2 * math.pi * r))
-        angles = np.linspace(0, 2 * math.pi, na, endpoint=False)
-        pxs = np.clip((best_x + r * np.cos(angles)).astype(int), 0, w - 1)
-        pys = np.clip((best_y + r * np.sin(angles)).astype(int), 0, h - 1)
-        profile.append(abs(diff[pys, pxs].mean()))
-
-    if not profile:
-        return None
-
-    peak = max(profile[:min(25, len(profile))])
-    if peak < min_signal:
-        return None
-
-    # Find radius where signal drops to 30% of peak
-    threshold = peak * 0.3
-    radius = 20
-    for r_idx, val in enumerate(profile):
-        if r_idx > 8 and val < threshold:
-            radius = r_idx + 1
-            break
-
-    radius = max(15, min(radius, 55))
-    return (best_x, best_y, radius)
-
-
-def deduplicate_spots(spots, min_dist=40):
-    """Remove duplicate spots that are too close together, keeping the larger one."""
-    if len(spots) < 2:
-        return spots
-    spots_sorted = sorted(spots, key=lambda s: -s["radius"])
-    kept = []
-    for s in spots_sorted:
-        is_dup = False
-        for k in kept:
-            d = math.sqrt((s["x"] - k["x"]) ** 2 + (s["y"] - k["y"]) ** 2)
-            if d < min_dist:
-                is_dup = True
-                break
-        if not is_dup:
-            kept.append(s)
-    return kept
-
-
-def grid_refine_spots(plate_spots, diff, median, plate):
-    """Use grid structure to find missing spots and remove non-grid detections."""
-    if len(plate_spots) < 4:
-        return plate_spots
-
-    row_positions, col_positions = infer_grid(plate_spots, plate)
-    if len(row_positions) < 2 or len(col_positions) < 2:
-        return plate_spots
-
-    pr = plate["r"]
-    pcx, pcy = plate["cx"], plate["cy"]
-    match_tolerance = pr * 0.10
-    typical_radius = int(np.median([s["radius"] for s in plate_spots]))
-
-    # Build expected grid positions (only inside plate)
-    expected = []
-    for ry in row_positions:
-        for cx in col_positions:
-            if math.sqrt((cx - pcx) ** 2 + (ry - pcy) ** 2) < pr * 0.80:
-                expected.append((int(cx), int(ry)))
-
-    # Match existing spots to grid positions
-    matched_spots = []
-    used_expected = set()
-    for s in plate_spots:
-        best_dist = float('inf')
-        best_ei = -1
-        for ei, (ex, ey) in enumerate(expected):
-            d = math.sqrt((s["x"] - ex) ** 2 + (s["y"] - ey) ** 2)
-            if d < best_dist:
-                best_dist = d
-                best_ei = ei
-        # Keep spots that match a grid position
-        if best_dist < match_tolerance:
-            matched_spots.append(s)
-            used_expected.add(best_ei)
-
-    # If grid matching removed too many spots, grid inference was wrong — abort
-    if len(matched_spots) < len(plate_spots) * 0.5:
-        return plate_spots
-
-    # Search for missing spots at unmatched grid positions
-    search_r = max(40, int(pr * 0.07))
-    pi = plate_spots[0]["plate_idx"]
-    for ei, (ex, ey) in enumerate(expected):
-        if ei in used_expected:
-            continue
-        result = find_spot_at_position(diff, median, ex, ey, search_r, plate)
-        if result:
-            bx, by, br = result
-            matched_spots.append({
-                "x": bx, "y": by,
-                "radius": max(br, int(typical_radius * 0.6)),
-                "plate_idx": pi, "label": ""
-            })
-
-    return deduplicate_spots(matched_spots)
-
-
 def run_detection(rgb, gray, sensitivity=5.0):
     plates = detect_plates(gray, rgb)
     spots = []
     diff_cache = {}
     median_cache = {}
     for pi, plate in enumerate(plates):
-        raw_spots, diff, median = find_spots_in_plate(gray, rgb, plate, sensitivity)
+        plate_spots, diff, median = find_spots_on_plate(gray, rgb, plate, sensitivity)
         diff_cache[pi] = diff
         median_cache[pi] = median
-        for cx, cy, radius, circ, strength in raw_spots:
-            spots.append({"x": cx, "y": cy, "radius": radius,
+        for x, y, radius in plate_spots:
+            spots.append({"x": x, "y": y, "radius": radius,
                           "plate_idx": pi, "label": ""})
 
-    spots = filter_spots_by_size(spots)
+    # Assign row/col based on position within each plate
+    for pi in range(len(plates)):
+        plate_spots = [(i, s) for i, s in enumerate(spots) if s["plate_idx"] == pi]
+        if len(plate_spots) < 2:
+            for i, s in plate_spots:
+                s["row"] = 0
+                s["col"] = 0
+            continue
 
-    # Grid-based refinement: per plate, infer grid and fill in missing spots
-    refined = []
-    for pi, plate in enumerate(plates):
-        plate_spots = [s for s in spots if s["plate_idx"] == pi]
-        if len(plate_spots) >= 3:
-            plate_spots = grid_refine_spots(
-                plate_spots, diff_cache[pi], median_cache[pi], plate)
-        refined.extend(plate_spots)
+        # Split into 2 rows by Y
+        ys = sorted(set(s["y"] for _, s in plate_spots))
+        if len(ys) >= 2:
+            mid_y = (min(ys) + max(ys)) / 2
+        else:
+            mid_y = ys[0]
 
-    refined.sort(key=lambda s: (s["plate_idx"], s["y"] // 50, s["x"]))
-    return plates, refined, diff_cache, median_cache
+        for i, s in plate_spots:
+            s["row"] = 0 if s["y"] < mid_y else 1
+
+        # Assign columns by X position within each row
+        for row in [0, 1]:
+            row_spots = [(i, s) for i, s in plate_spots if s["row"] == row]
+            row_spots.sort(key=lambda x: x[1]["x"])
+            for col, (i, s) in enumerate(row_spots):
+                s["col"] = col
+
+    spots.sort(key=lambda s: (s["plate_idx"], s["row"], s["col"]))
+    return plates, spots, diff_cache, median_cache
 
 
 # ─── Drawing ────────────────────────────────────────────────────────────────
@@ -438,13 +374,24 @@ def get_font(size=20):
     return ImageFont.load_default()
 
 
+def draw_outlined_text(draw, pos, text, fill, font, outline_color="#000000", width=3):
+    """Draw text with an outline for readability."""
+    x, y = pos
+    for dx in range(-width, width + 1):
+        for dy in range(-width, width + 1):
+            if dx == 0 and dy == 0:
+                continue
+            draw.text((x + dx, y + dy), text, fill=outline_color, font=font)
+    draw.text((x, y), text, fill=fill, font=font)
+
+
 def draw_annotated_image(rgb, plates, spots, selected_idx=None):
     """Draw plates, spots, zones, and labels on the image."""
     img = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(img)
-    # Scale font to image size — aim for ~2.5% of image height
-    font_size = max(32, int(rgb.shape[0] * 0.025))
-    small_size = max(26, int(font_size * 0.8))
+    # Scale font to image size — ~3.5% of image height for visibility
+    font_size = max(36, int(rgb.shape[0] * 0.035))
+    small_size = max(28, int(font_size * 0.7))
     font = get_font(font_size)
     small_font = get_font(small_size)
 
@@ -456,38 +403,30 @@ def draw_annotated_image(rgb, plates, spots, selected_idx=None):
         x, y, r = s["x"], s["y"], s["radius"]
         zone_r = s.get("zone_radius", r)
 
-        # Spot circle
         spot_color = "#FFD700" if i == selected_idx else "#66FF66"
         spot_width = 5 if i == selected_idx else 3
         draw.ellipse([x - r, y - r, x + r, y + r], outline=spot_color, width=spot_width)
 
-        # Zone boundary
         if zone_r > r + 2:
             zone_color = "#FF8800" if i == selected_idx else "#FF4444"
             draw.ellipse([x - zone_r, y - zone_r, x + zone_r, y + zone_r],
                          outline=zone_color, width=3)
 
-        # Center dot
         draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(50, 100, 255))
 
-        # Label — use text with dark outline for readability (no giant boxes)
+        # Labels with outline
         tx = x + max(r, zone_r) + 10
         num_text = f"#{i+1}"
         label = s.get("label", "")
+        grid_label = f"R{s.get('row', 0)+1}C{s.get('col', 0)+1}"
         text_color = "#FFFF00" if i != selected_idx else "#FFD700"
-        # Draw text with outline for contrast
-        for dx in [-2, -1, 0, 1, 2]:
-            for dy in [-2, -1, 0, 1, 2]:
-                if dx == 0 and dy == 0:
-                    continue
-                draw.text((tx + dx, y - font_size // 2 + dy), num_text,
-                          fill="#000000", font=font)
-                if label:
-                    draw.text((tx + dx, y + font_size // 2 + 2 + dy), label,
-                              fill="#000000", font=small_font)
-        draw.text((tx, y - font_size // 2), num_text, fill=text_color, font=font)
+        draw_outlined_text(draw, (tx, y - font_size - 2), num_text,
+                           fill=text_color, font=font)
+        draw_outlined_text(draw, (tx, y + 2), grid_label,
+                           fill="#00FF88", font=small_font)
         if label:
-            draw.text((tx, y + font_size // 2 + 2), label, fill="#FFFFFF", font=small_font)
+            draw_outlined_text(draw, (tx, y + small_size + 4), label,
+                               fill="#FFFFFF", font=small_font)
 
     return img
 
@@ -500,51 +439,7 @@ def assign_plate(plates, x, y):
     return 0
 
 
-def cluster_1d(values, min_gap_frac=0.3):
-    if not values:
-        return []
-    indexed = sorted(enumerate(values), key=lambda iv: iv[1])
-    clusters = [[indexed[0]]]
-    for i in range(1, len(indexed)):
-        gap = indexed[i][1] - indexed[i - 1][1]
-        if gap > min_gap_frac:
-            clusters.append([])
-        clusters[-1].append(indexed[i])
-    result = []
-    for cluster in clusters:
-        center = np.mean([v for _, v in cluster])
-        indices = [idx for idx, _ in cluster]
-        result.append((center, indices))
-    result.sort(key=lambda c: c[0])
-    return result
-
-
-def detect_grid(spots, plates):
-    for plate_idx in range(len(plates)):
-        plate = plates[plate_idx]
-        plate_spots = [(i, s) for i, s in enumerate(spots) if s["plate_idx"] == plate_idx]
-        if not plate_spots:
-            continue
-        pr = plate["r"]
-        gap_threshold = pr * 0.08
-
-        ys = [s["y"] for _, s in plate_spots]
-        y_clusters = cluster_1d(ys, gap_threshold)
-        for row_idx, (_, indices) in enumerate(y_clusters):
-            for idx in indices:
-                spots[plate_spots[idx][0]]["row"] = row_idx
-
-        xs = [s["x"] for _, s in plate_spots]
-        x_clusters = cluster_1d(xs, gap_threshold)
-        for col_idx, (_, indices) in enumerate(x_clusters):
-            for idx in indices:
-                spots[plate_spots[idx][0]]["col"] = col_idx
-
-    return spots
-
-
 def remeasure_spot(spots, idx, plates):
-    """Re-measure a single spot after it's been moved."""
     s = spots[idx]
     pi = s["plate_idx"]
     diff_cache = st.session_state.get("_diff", {})
@@ -567,8 +462,9 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is None:
     st.markdown(
-        "Upload an image of agar plates. The tool will detect plates and spots, "
-        "then you can adjust positions, label them, and generate measurements."
+        "Upload an image of agar plates. The tool will detect plates and find "
+        "spots in a **2-row x 3-column grid** on each plate, then you can "
+        "adjust positions, label them, and generate measurements."
     )
     st.stop()
 
@@ -614,7 +510,6 @@ if "_spots" not in st.session_state:
             pi = s["plate_idx"]
             m = measure_spot(median_cache[pi], diff_cache[pi], s, plates[pi])
             s.update(m)
-        spots = detect_grid(spots, plates)
         st.session_state._plates = plates
         st.session_state._spots = spots
         st.session_state._diff = diff_cache
@@ -663,20 +558,16 @@ with col_actions:
                 spots.pop(sel_idx)
                 st.session_state._spots = spots
                 st.session_state._selected_spot = max(0, sel_idx - 1) if spots else None
-                # Re-detect grid after deletion
-                spots = detect_grid(spots, plates)
-                st.session_state._spots = spots
                 st.rerun()
         with ac2:
             if st.button("Add spot at plate center"):
                 if plates:
                     p = plates[0]
                     new_spot = {"x": p["cx"], "y": p["cy"], "radius": 35,
-                                "plate_idx": 0, "label": ""}
+                                "plate_idx": 0, "label": "", "row": 0, "col": 0}
                     remeasure_spot([new_spot], 0, plates)
                     spots.append(new_spot)
-                    spots.sort(key=lambda s: (s["plate_idx"], s["y"] // 50, s["x"]))
-                    spots = detect_grid(spots, plates)
+                    spots.sort(key=lambda s: (s["plate_idx"], s["row"], s["col"]))
                     st.session_state._spots = spots
                     st.session_state._selected_spot = spots.index(new_spot)
                     st.rerun()
@@ -684,7 +575,8 @@ with col_actions:
 # Position adjustment for selected spot
 if spots and sel_idx is not None and sel_idx < len(spots):
     s = spots[sel_idx]
-    st.markdown(f"**Spot #{sel_idx+1}** — Plate {s['plate_idx']+1}")
+    st.markdown(f"**Spot #{sel_idx+1}** — Plate {s['plate_idx']+1}, "
+                f"Row {s.get('row',0)+1}, Col {s.get('col',0)+1}")
 
     p = plates[s["plate_idx"]]
     x_min, x_max = p["cx"] - p["r"], p["cx"] + p["r"]
@@ -702,7 +594,6 @@ if spots and sel_idx is not None and sel_idx < len(spots):
         s["x"] = new_x
         s["y"] = new_y
         remeasure_spot(spots, sel_idx, plates)
-        spots = detect_grid(spots, plates)
         st.session_state._spots = spots
         st.rerun()
 
@@ -762,7 +653,6 @@ for plate_idx in range(len(plates)):
 st.session_state._row_labels = row_labels
 st.session_state._col_labels = col_labels
 
-# Apply row/col labels to each spot
 for s in spots:
     pi = s["plate_idx"]
     r_key = f"p{pi}_r{s.get('row', 0)}"
@@ -805,6 +695,7 @@ for i, s in enumerate(spots):
     drop_circ = 2 * math.pi * dr
     rows.append({
         "Spot": i + 1, "Plate": s["plate_idx"] + 1,
+        "Grid": f"R{s.get('row',0)+1}C{s.get('col',0)+1}",
         "Label": raw_label or "Unlabeled",
         "Sample Type": sample_type,
         "Concentration": conc_val,
@@ -822,7 +713,7 @@ for i, s in enumerate(spots):
     })
 
 df = pd.DataFrame(rows)
-st.dataframe(df[["Spot", "Plate", "Label", "Spot Radius (px)", "Drop Intensity",
+st.dataframe(df[["Spot", "Plate", "Grid", "Label", "Spot Radius (px)", "Drop Intensity",
                   "Zone Diameter (px)", "Has Zone", "ZOI / Drop Area", "ZOI / Drop Circ"]],
              use_container_width=True, hide_index=True)
 
