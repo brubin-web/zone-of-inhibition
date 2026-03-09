@@ -47,9 +47,15 @@ def detect_plates(gray, rgb):
 def remove_pen_marks(gray, rgb, mask):
     pen_mask = np.zeros(gray.shape, dtype=np.uint8)
     r_ch, g_ch, b_ch = rgb[:, :, 0].astype(int), rgb[:, :, 1].astype(int), rgb[:, :, 2].astype(int)
-    pen_mask[(b_ch - r_ch > 15) & (mask > 0)] = 255
-    pen_mask[(r_ch - g_ch > 40) & (mask > 0)] = 255
-    pen_mask = cv2.dilate(pen_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20)))
+    # Blue ink (pen labels)
+    pen_mask[(b_ch - r_ch > 12) & (mask > 0)] = 255
+    # Red ink (pen labels)
+    pen_mask[(r_ch - g_ch > 30) & (r_ch > 150) & (mask > 0)] = 255
+    # Highly saturated colors (marker/pen) — use HSV saturation
+    # Only flag very saturated pixels (>130/255) to avoid removing real plate features
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    pen_mask[(hsv[:, :, 1] > 130) & (mask > 0)] = 255
+    pen_mask = cv2.dilate(pen_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
     return cv2.inpaint(gray, pen_mask, 25, cv2.INPAINT_TELEA)
 
 
@@ -76,6 +82,9 @@ def find_spots_in_plate(gray, rgb, plate, sensitivity=5.0):
     sat_diff = sat_blur - sat_bg
     sat_diff[mask == 0] = 0
 
+    # Rim exclusion: reject spots within 15% of plate edge
+    rim_limit = pr * 0.85
+
     all_contours = []
 
     def _find_contours_from(diff_img, threshold_val, min_strength):
@@ -93,11 +102,15 @@ def find_spots_in_plate(gray, rgb, plate, sensitivity=5.0):
             contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in contours:
                 area = cv2.contourArea(c)
-                if area < 200 or area > 100000:
+                if area < 300 or area > 100000:
                     continue
                 (x, y), radius = cv2.minEnclosingCircle(c)
                 circ = area / (math.pi * radius ** 2) if radius > 0 else 0
-                if circ < 0.3 or radius < 8:
+                if circ < 0.4 or radius < 10:
+                    continue
+                # Reject spots too close to plate rim
+                dist_from_center = math.sqrt((x - pcx) ** 2 + (y - pcy) ** 2)
+                if dist_from_center > rim_limit:
                     continue
                 contour_mask = np.zeros(gray.shape, dtype=np.uint8)
                 cv2.drawContours(contour_mask, [c], -1, 255, -1)
@@ -106,16 +119,16 @@ def find_spots_in_plate(gray, rgb, plate, sensitivity=5.0):
                     found.append((int(x), int(y), int(radius), circ, mean_val))
         return found
 
-    # Grayscale detection at multiple sensitivity levels
-    for s_mult in [1.0, 0.7, 0.5]:
+    # Grayscale detection at two sensitivity levels
+    for s_mult in [1.0, 0.7]:
         thresh = sensitivity * s_mult
-        all_contours.extend(_find_contours_from(diff, thresh, thresh * 0.5))
+        all_contours.extend(_find_contours_from(diff, thresh, thresh * 0.6))
 
     # HSV hue detection — spots often have a distinct hue shift
-    all_contours.extend(_find_contours_from(hue_diff, 2.0, 1.0))
+    all_contours.extend(_find_contours_from(hue_diff, 3.0, 1.5))
 
     # HSV saturation detection — spots may differ in saturation
-    all_contours.extend(_find_contours_from(sat_diff, 5.0, 3.0))
+    all_contours.extend(_find_contours_from(sat_diff, 8.0, 4.0))
 
     # Merge duplicates (same spot found by multiple methods)
     merged = []
@@ -138,27 +151,28 @@ def filter_spots_by_size(spots):
         return spots
     radii = sorted([s["radius"] for s in spots])
 
-    # Find a gap that separates small artifacts from real spots.
-    # Look for the first large relative gap (>50%) that keeps a reasonable
-    # number of spots — artifacts cluster at small radii, real spots are bigger.
+    # Find the largest relative gap — if it's really clear (>80% jump),
+    # use it to separate artifacts from real spots
+    best_gap_rel = 0
     best_cutoff = 0
     for i in range(1, len(radii)):
         gap = radii[i] - radii[i - 1]
         rel_gap = gap / max(radii[i - 1], 1)
         remaining = len(radii) - i
-        # Need: big relative gap, absolute gap >= 4px, keeps at least 15% of spots
-        if rel_gap > 0.5 and gap >= 4 and remaining >= max(3, len(radii) * 0.15):
+        if rel_gap > best_gap_rel and gap >= 5 and remaining >= 3:
+            best_gap_rel = rel_gap
             best_cutoff = (radii[i - 1] + radii[i]) / 2
-            break  # Take the first qualifying gap (lowest cutoff)
 
-    if best_cutoff > 0:
+    # Only use gap filter if the gap is very obvious (>80% size jump)
+    if best_cutoff > 0 and best_gap_rel > 0.8:
         filtered = [s for s in spots if s["radius"] >= best_cutoff]
         if len(filtered) >= 3:
             return filtered
 
-    # Fallback: use max radius as reference
-    max_r = radii[-1]
-    min_r = max_r * 0.4
+    # Fallback: keep spots with radius >= 35% of the 80th-percentile spot
+    # (using percentile instead of max to be robust against outliers)
+    ref_r = radii[min(int(len(radii) * 0.8), len(radii) - 1)]
+    min_r = ref_r * 0.35
     filtered = [s for s in spots if s["radius"] >= min_r]
     if len(filtered) >= 3:
         return filtered
@@ -264,9 +278,9 @@ def draw_annotated_image(rgb, plates, spots, selected_idx=None):
     """Draw plates, spots, zones, and labels on the image."""
     img = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(img)
-    # Scale font to image size — aim for ~1.5% of image height
-    font_size = max(24, int(rgb.shape[0] * 0.015))
-    small_size = max(20, int(font_size * 0.8))
+    # Scale font to image size — aim for ~2.5% of image height
+    font_size = max(32, int(rgb.shape[0] * 0.025))
+    small_size = max(26, int(font_size * 0.8))
     font = get_font(font_size)
     small_font = get_font(small_size)
 
@@ -292,19 +306,24 @@ def draw_annotated_image(rgb, plates, spots, selected_idx=None):
         # Center dot
         draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(50, 100, 255))
 
-        # Label
+        # Label — use text with dark outline for readability (no giant boxes)
         tx = x + max(r, zone_r) + 10
         num_text = f"#{i+1}"
         label = s.get("label", "")
-        line_h = font_size + 4
-        small_h = small_size + 4
-        box_h = line_h + (small_h if label else 0) + 4
-        box_w = max(len(num_text), len(label)) * int(font_size * 0.65) + 12
-        draw.rectangle([tx - 4, y - line_h // 2 - 2, tx + box_w, y - line_h // 2 + box_h],
-                       fill="rgba(0,0,0,180)" if i != selected_idx else "rgba(80,60,0,200)")
-        draw.text((tx + 2, y - line_h // 2), num_text, fill="#FFFF00", font=font)
+        text_color = "#FFFF00" if i != selected_idx else "#FFD700"
+        # Draw text with outline for contrast
+        for dx in [-2, -1, 0, 1, 2]:
+            for dy in [-2, -1, 0, 1, 2]:
+                if dx == 0 and dy == 0:
+                    continue
+                draw.text((tx + dx, y - font_size // 2 + dy), num_text,
+                          fill="#000000", font=font)
+                if label:
+                    draw.text((tx + dx, y + font_size // 2 + 2 + dy), label,
+                              fill="#000000", font=small_font)
+        draw.text((tx, y - font_size // 2), num_text, fill=text_color, font=font)
         if label:
-            draw.text((tx + 2, y - line_h // 2 + line_h), label, fill="#FFFFFF", font=small_font)
+            draw.text((tx, y + font_size // 2 + 2), label, fill="#FFFFFF", font=small_font)
 
     return img
 
